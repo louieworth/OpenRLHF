@@ -35,7 +35,7 @@ OpenRLHF 是一个基于 Ray、DeepSpeed 和 HF Transformers 构建的高性能 
 - **简单易用**: OpenRLHF 是目前可用的最简单的高性能 RLHF 库之一，兼容 Huggingface 模型和数据集。
 - **高性能**: RLHF 训练中 80% 的时间用于样本生成阶段。得益于使用 Ray 和 Adam Offload（固定内存）以及 vLLM 生成加速的能力，OpenRLHF 的性能是极致优化的 DeepSpeedChat with Hybrid Engine 的两倍以上。
 - **分布式 RLHF**:  OpenRLHF 使用 Ray 将 Actor、Reward、Reference 和 Critic 模型分布到不同的 GPU 上，同时将 Adam 优化器放在 CPU 上。这使得使用多个 A100 80G GPU 和 vLLM 可以全面微调超过 70B+ 的模型 (见 [architecture](./docs/ray_architecture.png)) 以及在多个 24GB RTX 4090 GPU 上微调 7B 模型。
-- **PPO 实现技巧**: 我们集成了 PPO 的实现技巧以提高训练稳定性，参考 https://arxiv.org/abs/2005.12729 和 https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/.
+- **PPO 实现技巧**: 我们集成了 PPO 的实现技巧以提高训练稳定性，参考 [Notion AI blog](https://difficult-link-dd7.notion.site/eb7b2d1891f44b3a84e7396d19d39e6f?v=01bcb084210149488d730064cbabc99f).
 
 
 ## 特性
@@ -47,16 +47,17 @@ OpenRLHF 是一个基于 Ray、DeepSpeed 和 HF Transformers 构建的高性能 
 - 支持 [DPO (直接偏好优化)/IPO/cDPO](./examples/scripts/train_dpo_llama.sh).
 - 支持 [Kahneman-Tversky 优化 (KTO)](./examples/scripts/train_kto_llama.sh).
 - 支持 [拒绝采样](./examples/scripts/train_rejection_sampling_llama.sh).
+- 支持 [Iterative DPO](./examples/scripts/train_iterative_dpo_llama.sh) (https://github.com/RLHFlow/Online-RLHF).
 - 支持 [条件 SFT](./examples/scripts/train_conditional_llama.sh) (https://arxiv.org/abs/2308.12050).
 - 支持 [Mixtral 8*7b](./examples/test_scripts/train_sft_mixtral_lora.sh) (--aux_loss_coef)
 - 支持 Wandb 日志 (--wandb).
 - 支持 FlashAttention2 (--flash_attn).
 - 支持 QLoRA (--load_in_4bit), LoRA (--lora_rank, --target_modules).
+- 支持 HuggingFace `tokenizer.apply_chat_template` 用于数据集处理 ([--apply_chat_template and --input_key](./examples/scripts/train_ppo_llama3_ray_colocate.sh)).
 - 多节点 [训练脚本](./examples/scripts/train_llama_slurm.sh) 适用于 Slurm.
 
 **待办事项** 
 - 允许保存和加载训练检查点。
-- 支持混合 vLLM 推理引擎。
 
 **PPO 支持矩阵**
 
@@ -84,6 +85,9 @@ OpenRLHF 是一个基于 Ray、DeepSpeed 和 HF Transformers 构建的高性能 
 | 13B | 32 | 1528.93 | 608.93 | 2.5x |
 | 34B | 32 | 3634.98 | 1526.4 | 2.4x |
 | 70B | 32 | 10407.0 | 4488.53 | 2.3x |
+
+## 调优指南
+为了获得最佳的性能，我们建议您分配更多的节点给 vLLM Engine。例如，对于 70B 模型以及 32 张 A100，建议分配 16 张以上 A100 给 vLLM Engine，8 张给 Actor 模型，以及最后 8 张给 Critic 模型，同时开启 `--colocate_critic_reward`, `--colocate_actor_ref` 和 `--ref_reward_offload` 选项合并部分节点，可参考脚本 [Llama3 Ray PPO](./examples/scripts/train_ppo_llama3_ray_colocate.sh)。最后您应该尽可能在避免 OOM 的前提下增大 micro-batch-size (以及减小 vLLM 的 TP 切分数量) 尤其对于 PPO 样本推理生成阶段。
 
 
 ## 运行示例
@@ -125,6 +129,9 @@ wandb.login()
 **单节点训练**
 
 ```shell
+# 继续预训练
+./train_continue_pretrain_llama.sh
+
 # 监督式微调
 ./train_sft_llama.sh
 
@@ -143,11 +150,11 @@ wandb.login()
 # 使用 vLLM 的拒绝采样训练
 ./train_rejection_sampling_llama.sh
 
+# Iterative DPO with vLLM
+./train_iterative_dpo_llama.sh
+
 # 条件 SFT
 ./train_conditional_llama.sh
-
-# 继续预训练
-./train_continue_pretrain_llama.sh
 ```
 
 **使用Ray进行PPO训练**
@@ -167,6 +174,9 @@ ray start --address {MASTER-NODE-ADDRESS}:6379  --num-gpus 8
 # 启动使用 vLLM 的 Ray PPO，默认配置需要 16 个 A100
 ./train_ppo_llama_ray_70b.sh
 ```
+
+> [!NOTE]
+> 我们建议使用 vLLM 0.4.2，因为 0.4.3 及以上版本目前只能通过 GLOO (--vllm_sync_backend gloo) 进行权重同步 (DeepSpeed => vLLM)。
 
 **在 Slurm 上进行多节点训练**
 
@@ -206,7 +216,7 @@ sbatch ./train_ppo_llama_ray_slurm.sh
 python examples/batch_inference.py {args}
 
 # 交互式聊天
-./interactive_chat_llama.sh { pretrain_model_path }
+python examples/interactive_chat.py --bf16 --pretrain { pretrain_model_path }
 ```
 
 **从 conda 环境构建 openrlhf**
@@ -222,8 +232,7 @@ pip3 install torch
 ninja --version
 echo $? # output: 0
 # 安装 flash-attn：可能需要一些时间。
-# 对于网络错误：您可以从 https://github.com/Dao-AILab/flash-attention/releases 下载指定版本。
-pip install flash-attn==2.5.0
+pip install flash-attn==2.5.8
 ./build_openrlhf.sh
 # 享受它！
 ```

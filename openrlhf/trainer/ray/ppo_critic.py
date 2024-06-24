@@ -75,6 +75,7 @@ class CriticModelRayActor(BasePPORole):
             target_modules=strategy.args.target_modules,
             lora_dropout=strategy.args.lora_dropout,
             ds_config=strategy.get_ds_train_config(is_actor=False),
+            head_prefix=strategy.args.head_prefix,
         )
         strategy.print(critic)
         strategy.print("reward normalization status: {}".format(strategy.args.normalize_reward))
@@ -155,3 +156,6 @@ class CriticModelRayActor(BasePPORole):
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
         return status
+
+    def empty_cache(self) -> None:
+        torch.cuda.empty_cache()

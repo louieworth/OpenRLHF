@@ -9,7 +9,9 @@ from .reward_dataset import RewardDataset
 from .utils import exist_and_not_none, zero_pad_sequences
 
 
-def preprocess_data(data, input_template=None, prompt_key=None, output_key=None, label_key=None):
+def preprocess_data(
+    data, input_template=None, prompt_key=None, output_key=None, label_key=None, apply_chat_template=None
+):
     """
     Preprocess data from raw dataset to prompt, response, label
 
@@ -25,6 +27,11 @@ def preprocess_data(data, input_template=None, prompt_key=None, output_key=None,
             input_template = None  # do not modified with input template again
         response = data[output_key]
         label = data[label_key]
+
+        if apply_chat_template:
+            response = apply_chat_template(response, tokenize=False)
+            prompt = ""
+            input_template = None
     else:
         # Dylan2048/ultrafeedback-unpaired-preferences
         if exist_and_not_none(data, "score"):
@@ -51,7 +58,7 @@ class UnpairedPreferenceDataset(Dataset):
     """
 
     def __init__(
-        self, dataset, tokenizer: Callable, max_length: int, strategy, input_template="Human:\n{}\nAssistant:\n"
+        self, dataset, tokenizer: Callable, max_length: int, strategy, input_template="Human: {}\nAssistant: "
     ) -> None:
         super().__init__()
         self.prompts = []
@@ -60,12 +67,19 @@ class UnpairedPreferenceDataset(Dataset):
         self.tokenizer = tokenizer
         self.strategy = strategy
         self.max_length = max_length
+        self.add_eos_token = " " + self.tokenizer.eos_token
+
         prompt_key = getattr(self.strategy.args, "prompt_key", None)
         output_key = getattr(self.strategy.args, "output_key", None)
         label_key = getattr(self.strategy.args, "label_key", None)
+        apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+        if apply_chat_template:
+            apply_chat_template = self.tokenizer.apply_chat_template
 
         for data in tqdm(dataset, disable=not self.strategy.is_rank_0()):
-            prompt, response, label = preprocess_data(data, input_template, prompt_key, output_key, label_key)
+            prompt, response, label = preprocess_data(
+                data, input_template, prompt_key, output_key, label_key, apply_chat_template
+            )
             self.prompts.append(prompt)
             self.responses.append(response)
             self.labels.append(label)
@@ -78,8 +92,11 @@ class UnpairedPreferenceDataset(Dataset):
 
     def collate_fn(self, item_list):
         def tokenizer(prompt, response):
+            text = (prompt + response).rstrip("\n")
+            if not text.endswith(self.tokenizer.eos_token):
+                text += " " + self.tokenizer.eos_token
             inputs = self.tokenizer(
-                prompt + response + " " + self.tokenizer.eos_token,
+                text,
                 max_length=self.max_length,
                 padding=False,
                 truncation=True,
@@ -145,9 +162,11 @@ class UnpairedRewardDataset(Dataset):
 
     def collate_fn(self, item_list):
         def concat_to_tensor(prompt, response):
-            response = prompt + response + " " + self.tokenizer.eos_token
+            text = (prompt + response).rstrip("\n")
+            if not text.endswith(self.tokenizer.eos_token):
+                text += " " + self.tokenizer.eos_token
             response_token = self.tokenizer(
-                response,
+                text,
                 max_length=self.max_length,
                 padding=False,
                 truncation=True,

@@ -76,25 +76,39 @@ class ActorPPOTrainer(PPOTrainer):
                 self.strategy.args.vllm_tensor_parallel_size,
             )
             world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
+
+            backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
+            # https://github.com/OpenLLMAI/OpenRLHF/issues/313
+            import vllm
+
+            if vllm.__version__ > "0.4.2":
+                backend = "gloo"
+                print("Warning: using --vllm_sync_backend=gloo for vLLM version > 0.4.2")
+
             refs = [
                 engine.init_process_group.remote(
-                    master_address, master_port, i * vllm_tensor_parallel_size + 1, world_size, "vllm"
+                    master_address,
+                    master_port,
+                    i * vllm_tensor_parallel_size + 1,
+                    world_size,
+                    "openrlhf",
+                    backend=backend,
                 )
                 for i, engine in enumerate(self.vllm_engines)
             ]
             self._model_update_group = init_process_group(
-                backend="nccl",
+                backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
                 rank=0,
-                group_name="vllm",
+                group_name="openrlhf",
             )
 
             ray.get(refs)
 
         torch.distributed.barrier()
 
-    def ppo_train(self):
+    def ppo_train(self, global_steps):
         # 1. ensure all experience makers done
         self.experience_maker.flush()
         torch.distributed.barrier()
@@ -104,11 +118,15 @@ class ActorPPOTrainer(PPOTrainer):
             critic_status_ref = self.critic.fit.remote()
 
         # 3. actor model training
-        status = super().ppo_train()
+        if global_steps > self.freezing_actor_steps:
+            status = super().ppo_train(global_steps)
 
-        # 4. broadcast weights to vllm engines
-        if self.vllm_engines is not None:
-            self._broadcast_to_vllm()
+            # 4. broadcast weights to vllm engines
+            if self.vllm_engines is not None:
+                torch.distributed.barrier()
+                self._broadcast_to_vllm()
+        else:
+            status = {}
 
         # 5. wait remote critic model training done
         if self.critic_train_remote:
@@ -117,7 +135,7 @@ class ActorPPOTrainer(PPOTrainer):
 
         return status
 
-    def training_step(self, experience: Experience) -> Dict[str, float]:
+    def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:
         return self.training_step_actor(experience)
 
     def _broadcast_to_vllm(self):
@@ -129,20 +147,16 @@ class ActorPPOTrainer(PPOTrainer):
             # Fire all vllm engines for broadcast
             if torch.distributed.get_rank() == 0:
                 shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
-                [
+                refs = [
                     engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
                     for engine in self.vllm_engines
                 ]
 
-            if self.strategy.args.zero_stage != 3:
-                # For ZeRO-1/2, broadcast parameter to all vllm engines by rank 0
+            # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
+            with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
                 if torch.distributed.get_rank() == 0:
                     torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
-            else:
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param]):
-                    if torch.distributed.get_rank() == 0:
-                        torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
+                    ray.get(refs)
 
 
 @ray.remote(num_gpus=1)

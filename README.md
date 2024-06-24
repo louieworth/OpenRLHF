@@ -32,7 +32,7 @@ OpenRLHF is a high-performance RLHF framework built on Ray, DeepSpeed and HF Tra
 - **Simple and easy to use**: OpenRLHF is one of the simplest high-performance RLHF libraries currently available, and compatible with Huggingface models and datasets.
 - **High performance**: RLHF training spends 80% of the time on the sample generation stage. Thanks to the ability to use a large inference batch size with Ray and Adam Offload (Pinned Memory) and vLLM generation acceleration, the performance of OpenRLHF 2x+ that of Optimized DeepSpeedChat with Hybrid Engine.
 - **Distributed RLHF**:  OpenRLHF distribute the Actor, Reward, Reference, and Critic models onto separate GPUs using Ray, while placing the Adam optimizer on the CPU. This enables full-scale fine-tuning of 70B+ models with multiple A100 80G GPUs and vLLM (see [architecture](./docs/ray_architecture.png)) and 7B models across multiple 24GB RTX 4090 GPUs.
-- **PPO Implementation Tricks**: We integrated the implementation tricks for PPO to improve the training stability, referencing https://arxiv.org/abs/2005.12729 and https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/.
+- **PPO Implementation Tricks**: We integrated the implementation tricks for PPO to improve the training stability, referencing the [Notion AI blog](https://difficult-link-dd7.notion.site/eb7b2d1891f44b3a84e7396d19d39e6f?v=01bcb084210149488d730064cbabc99f).
 
 
 ## Features
@@ -44,24 +44,25 @@ OpenRLHF is a high-performance RLHF framework built on Ray, DeepSpeed and HF Tra
 - Support [DPO (direct-preference-optimization)/IPO/cDPO](./examples/scripts/train_dpo_llama.sh).
 - Support [Kahneman-Tversky optimization (KTO)](./examples/scripts/train_kto_llama.sh).
 - Support [Rejection Sampling](./examples/scripts/train_rejection_sampling_llama.sh).
+- Support [Iterative DPO](./examples/scripts/train_iterative_dpo_llama.sh) (https://github.com/RLHFlow/Online-RLHF).
 - Support [Conditional SFT](./examples/scripts/train_conditional_llama.sh) (https://arxiv.org/abs/2308.12050).
 - Support [Mixtral 8*7b](./examples/test_scripts/train_sft_mixtral_lora.sh) (--aux_loss_coef)
 - Support Wandb log (--wandb).
 - Support FlashAttention2 (--flash_attn).
 - Support QLoRA (--load_in_4bit), LoRA (--lora_rank, --target_modules).
+- Support HuggingFace `tokenizer.apply_chat_template` in datasets ([--apply_chat_template and --input_key](./examples/scripts/train_ppo_llama3_ray_colocate.sh)).
 - Multi-nodes [training scripts](./examples/scripts/train_llama_slurm.sh) for Slurm.
 
 **TODO** 
 - Allows saving and loading training checkpoints.
-- Support Hybrid vLLM inference engine.
 
-**PPO Support Matrix**
+**PPO Support Matrix** 
 
 | Feature | OpenRLHF | DSChat | CAIChat | TRL |
 | ------------- |:-------------:| :-------------:| :-------------:| :-------------:|
-| 70B+ Full Tuning with 16 A100      | ✅ | ❌ | ❌ | ❌ |
+| 70B+ Full Tuning with 16 A100-80GB      | ✅ | ❌ | ❌ | ❌ |
 | 7B Full Tuning with 4 RTX4090 | ✅      |    ❌ | ❌ | ❌ |
-| 34B DPO Full Tuning with 8 A100 | ✅      |    ❌ | ❌ | ❌ |  
+| 34B DPO Full Tuning with 8 A100-80GB | ✅      |    ❌ | ❌ | ❌ |  
 | Inference Engine in PPO | ✅      |    ✅ | ❌ | ❌ |  
 | PPO Implementation Tricks | ✅      |    ❌ | ❌ | ✅ |
 | Support QLoRA | ✅      |    ❌ | ❌ | ✅ | 
@@ -76,12 +77,16 @@ OpenRLHF is a high-performance RLHF framework built on Ray, DeepSpeed and HF Tra
 
 We optimized DSChat's performance to the greatest extent possible by employing techniques such as enabling Adam offload, along with reward model (RM) and reference model (Ref) offload to increase the micro-batch size during the inference stage and avoid out-of-memory issues. We even fixed some bugs in DSChat to enable the Hybrid Engine (HE) for LLaMA2. The average time (seconds) it took to train 1024 prompts with 1 PPO epoch using the Optimized DSChat and OpenRLHF:
 
-| **Size** | **NVIDIA A800 GPUs** | **Optimized DSChat (with  Hybrid Engine)** | **OpenRLHF** | **Speedup** |
+| **Size** | **NVIDIA A800-80GB GPUs** | **Optimized DSChat (with  Hybrid Engine)** | **OpenRLHF** | **Speedup** |
 | :---: | :---: | :---: | :---: | :---: |
 | 7B | 16 | 855.09 | 471.11 | 1.82x |
 | 13B | 32 | 1528.93 | 608.93 | 2.5x |
 | 34B | 32 | 3634.98 | 1526.4 | 2.4x |
 | 70B | 32 | 10407.0 | 4488.53 | 2.3x |
+
+## Performance Tuning Guide
+
+To achieve optimal performance, we recommend allocating more nodes to the vLLM Engine. For example, for a 70B model with 32 A100 GPUs, it is advised to allocate more than 16 A100 GPUs to the vLLM Engine, 8 GPUs to the Actor model, and the remaining 8 GPUs to the Critic model. Additionally, enable the `--colocate_critic_reward`, `--colocate_actor_ref`, and `--ref_reward_offload` options to merge nodes. You can refer to the script [Llama3 Ray PPO](./examples/scripts/train_ppo_llama3_ray_colocate.sh) for more details. Finally, you should increase the micro-batch-size (and minimize the TP size of vLLM engine) as much as possible while avoiding OOM (Out Of Memory) issues, especially during the generation phase of PPO.
 
 
 ## Running Example
@@ -124,6 +129,9 @@ wandb.login()
 **Single-node training**
 
 ```shell
+# Continue Pre-training
+./train_continue_pretrain_llama.sh
+
 # Supervised Finetuning
 ./train_sft_llama.sh
 
@@ -142,11 +150,11 @@ wandb.login()
 # Rejection Sampling with vLLM
 ./train_rejection_sampling_llama.sh
 
+# Iterative DPO with vLLM
+./train_iterative_dpo_llama.sh
+
 # Conditional SFT
 ./train_conditional_llama.sh
-
-# Continue Pre-training
-./train_continue_pretrain_llama.sh
 ```
 
 **PPO training with Ray**
@@ -166,6 +174,8 @@ ray start --address {MASTER-NODE-ADDRESS}:6379  --num-gpus 8
 # Launch Ray PPO with vLLM, requires 16 A100s in default config
 ./train_ppo_llama_ray_70b.sh
 ```
+> [!NOTE]
+> We recommend using vLLM 0.4.2, as versions 0.4.3+ currently only support weight synchronization (DeepSpeed => vLLM) via GLOO (--vllm_sync_backend gloo).
 
 **Multi-nodes training on Slurm**
 
@@ -203,7 +213,7 @@ After completing the training, you can evaluate your model by using the `inferen
 python examples/batch_inference.py {args}
 
 # interactive_chat
-./interactive_chat_llama.sh { pretrain_model_path }
+python examples/interactive_chat.py --bf16 --pretrain { pretrain_model_path }
 ```
 
 **build openrlhf from conda envs**
@@ -219,8 +229,7 @@ pip3 install torch
 ninja --version
 echo $? # output: 0
 # install flash-attn: may take some time.
-# For network error: you can download specified version from https://github.com/Dao-AILab/flash-attention/releases.
-pip install flash-attn==2.5.0
+pip install flash-attn==2.5.8
 ./build_openrlhf.sh
 # enjoy it!
 ```

@@ -185,6 +185,7 @@ if __name__ == "__main__":
         default=1,
         help="tensor parallel size of vLLM Engine for multi-GPU inference",
     )
+    parser.add_argument("--vllm_sync_backend", type=str, default="nccl", help="DeepSpeed -> vLLM weight sync backend")
 
     parser.add_argument("--prompt_data", type=str, default=None)
     parser.add_argument(
@@ -237,7 +238,6 @@ if __name__ == "__main__":
     parser.add_argument("--enable_ema", action="store_true", help="Enable EMA checkpoint for the model.")
     parser.add_argument("--zpg", type=int, default=1, help="ZeRO++ max partition size")
     parser.add_argument("--adam_offload", action="store_true", default=False)
-    parser.add_argument("--ref_reward_offload", action="store_true", default=False)
     parser.add_argument("--actor_init_on_gpu", action="store_true", default=False)
     parser.add_argument("--flash_attn", action="store_true", default=False)
     parser.add_argument("--aux_loss_coef", type=float, default=0)
@@ -248,12 +248,18 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--target_modules", type=str, nargs="*", default="all-linear")
     parser.add_argument("--lora_dropout", type=float, default=0)
-    parser.add_argument("--input_template", type=str, default="Human:\n{}\nAssistant:\n")
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true")
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
+    parser.add_argument("--freezing_actor_steps", type=int, default=-1)
+
+    # reward model
+    parser.add_argument("--head_prefix", type=str, default="value_head")
+    parser.add_argument("--ref_reward_offload", action="store_true", default=False)
 
     # custom dataset key name
     parser.add_argument("--input_key", type=str, default=None)
+    parser.add_argument("--input_template", type=str, default="Human: {}\nAssistant: ")
+    parser.add_argument("--apply_chat_template", action="store_true", default=False)
 
     # evaluation
     parser.add_argument("--eval_steps", type=int, default=-1)

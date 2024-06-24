@@ -1,3 +1,4 @@
+accelerate
 bitsandbytes
 datasets
 deepspeed==0.13.5
@@ -17,3 +18,4 @@ transformers==4.41.0
 transformers_stream_generator
 wandb
 wheel
+#vllm==0.4.2

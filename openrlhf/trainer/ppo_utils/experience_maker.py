@@ -251,9 +251,11 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # avoid CUDA OOM when colocate models
         if self.strategy.args.colocate_critic_reward:
             ray.get([value_ref])
+            ray.get([self.critic.empty_cache.remote()])
 
         if self.strategy.args.colocate_actor_ref:
             ray.get([base_action_log_probs_ref])
+            ray.get([self.initial_model.empty_cache.remote()])
 
         # rewards
         r_refs = []
@@ -274,6 +276,13 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         base_action_log_probs, value = base_action_log_probs.to(device), value.to(device)
         rewards = [r.to(device) for r in rewards]
         r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
+
+        # avoid CUDA OOM when colocate models
+        if self.strategy.args.colocate_critic_reward:
+            ray.get([self.reward_model[0].empty_cache.remote()])
+
+        if self.strategy.args.colocate_actor_ref:
+            torch.cuda.empty_cache()
 
         reward, kl = compute_reward(
             r,
@@ -338,7 +347,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             temperature=kwargs.get("temperature", 1.0),
             top_p=kwargs.get("top_p", 1.0),
             top_k=kwargs.get("top_k", -1),
-            max_tokens=kwargs.get("max_new_tokens", 16),
+            max_tokens=kwargs.get("max_new_tokens", 1024),
+            min_tokens=kwargs.get("min_new_tokens", 1),
         )
 
         # TODO: can't pass `max_length` to vLLM's tokenizer for input truncation, remove this once it is supported.
@@ -358,14 +368,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # |<---------- prompt ----------->|<-------- answer ------->|
         max_input_len, max_output_len = 0, 0
         for output in outputs:
-            # TODO: how to force vLLM generate at least one token?
-            output_token_ids = output.outputs[0].token_ids
-            if output_token_ids[0] == self.tokenizer.eos_token_id:
-                logger.warning(f"Only EOS output for prompt: {output.prompt}")
-                output.outputs[0].token_ids = [self.tokenizer.unk_token_id, self.tokenizer.eos_token_id]
-
             max_input_len = max(max_input_len, len(output.prompt_token_ids))
-            max_output_len = max(max_output_len, len(output_token_ids))
+            max_output_len = max(max_output_len, len(output.outputs[0].token_ids))
 
         pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
         sequences = []
@@ -377,9 +381,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             # right padding output
             output_len = len(output.outputs[0].token_ids)
             output_ids = output.outputs[0].token_ids + [pad_token_id] * (max_output_len - output_len)
+
             if output_ids[output_len - 1] != eos_token_id:
-                assert output_len == max_output_len
-                output_ids[-1] = eos_token_id
+                output_ids[min(output_len, len(output_ids) - 1)] = eos_token_id
 
             # concat input and output
             sequences.append(input_ids + output_ids)

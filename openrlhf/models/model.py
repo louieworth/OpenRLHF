@@ -30,6 +30,8 @@ def get_llm_for_sequence_regression(
     use_flash_attention_2=False,
     ds_config: dict = None,
     init_value_head: bool = False,
+    head_prefix="value_head",
+    device_map=None,
     **kwargs,
 ) -> nn.Module:
     """Get transformer with a sequence classification head on top (linear layer).
@@ -58,9 +60,9 @@ def get_llm_for_sequence_regression(
         base_class = AutoModel._model_mapping[type(config)]
         base_pretrained_class = base_class.__base__
         if model_type == "reward":
-            cls_class = _get_reward_model(base_pretrained_class, base_class)
+            cls_class = _get_reward_model(base_pretrained_class, base_class, head_prefix)
         else:
-            cls_class = _get_critic_model(base_pretrained_class, base_class)
+            cls_class = _get_critic_model(base_pretrained_class, base_class, head_prefix)
     except Exception as e:
         print("Failed to load from AutoModel, construct from modelling file.")
         module_file, causal_model_name = config.auto_map["AutoModelForCausalLM"].split(".")
@@ -86,9 +88,9 @@ def get_llm_for_sequence_regression(
         )
         base_class = get_class_from_dynamic_module(f"{module_file}.{auto_model_name}", model_name_or_path)
         if model_type == "reward":
-            cls_class = _get_reward_model(base_pretrained_class, base_class)
+            cls_class = _get_reward_model(base_pretrained_class, base_class, head_prefix)
         else:
-            cls_class = _get_critic_model(base_pretrained_class, base_class)
+            cls_class = _get_critic_model(base_pretrained_class, base_class, head_prefix)
 
     # Note: dschf is defined in function scope to avoid global effects
     # https://huggingface.co/docs/transformers/main_classes/deepspeed#nontrainer-deepspeed-integration
@@ -114,6 +116,7 @@ def get_llm_for_sequence_regression(
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if bf16 else "auto",
         quantization_config=nf4_config,
+        device_map=device_map,
         **kwargs,
     )
 
@@ -135,7 +138,7 @@ def get_llm_for_sequence_regression(
                     module = module.to(torch.bfloat16)
                 if "norm" in name:
                     module = module.to(torch.float32)
-                if "value_head" in name or "embed_tokens" in name:
+                if head_prefix in name or "embed_tokens" in name:
                     if hasattr(module, "weight"):
                         module = module.to(torch.bfloat16)
 
@@ -160,15 +163,16 @@ def get_llm_for_sequence_regression(
     return model
 
 
-def _get_reward_model(base_pretrained_model, base_llm_model):
-    class LLMForSequenceRegression(base_pretrained_model):
+def _get_reward_model(base_pretrained_model, base_llm_model, head_prefix="value_head"):
+    class RewardModel(base_pretrained_model):
         supports_gradient_checkpointing = True
 
         def __init__(self, config: AutoConfig):
             super().__init__(config)
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
-            self.value_head = nn.Linear(config.hidden_size, 1, bias=False)
+            self.head_prefix = head_prefix
+            setattr(self, head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
 
             # mean std
             self.normalize_reward = config.normalize_reward
@@ -193,7 +197,7 @@ def _get_reward_model(base_pretrained_model, base_llm_model):
                 input_ids, attention_mask=attention_mask, position_ids=position_ids
             )
             last_hidden_states = outputs["last_hidden_state"]
-            values = self.value_head(last_hidden_states).squeeze(-1)
+            values = getattr(self, self.head_prefix)(last_hidden_states).squeeze(-1)
 
             # left padding in training mode
             if self.training:
@@ -210,18 +214,19 @@ def _get_reward_model(base_pretrained_model, base_llm_model):
             else:
                 return reward
 
-    return LLMForSequenceRegression
+    return RewardModel
 
 
-def _get_critic_model(base_pretrained_model, base_llm_model):
-    class LLMForSequenceRegression(base_pretrained_model):
+def _get_critic_model(base_pretrained_model, base_llm_model, head_prefix="value_head"):
+    class CriticModel(base_pretrained_model):
         supports_gradient_checkpointing = True
 
         def __init__(self, config: AutoConfig):
             super().__init__(config)
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
-            self.value_head = nn.Linear(config.hidden_size, 1, bias=False)
+            self.head_prefix = head_prefix
+            setattr(self, head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
 
             # mean std
             self.normalize_reward = config.normalize_reward
@@ -249,7 +254,7 @@ def _get_critic_model(base_pretrained_model, base_llm_model):
                 position_ids=position_ids,
             )
             last_hidden_states = outputs["last_hidden_state"]
-            values = self.value_head(last_hidden_states).squeeze(-1)[:, :-1]
+            values = getattr(self, self.head_prefix)(last_hidden_states).squeeze(-1)[:, :-1]
             num_actions = action_mask.size(1)
 
             # normalize reward
@@ -261,4 +266,4 @@ def _get_critic_model(base_pretrained_model, base_llm_model):
             else:
                 return values[:, -num_actions:]
 
-    return LLMForSequenceRegression
+    return CriticModel

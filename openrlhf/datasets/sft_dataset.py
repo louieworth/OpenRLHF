@@ -1,43 +1,32 @@
 from typing import Callable
+
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from .utils import exist_and_not_none, zero_pad_sequences
+
+from .utils import exist_and_not_none, process_multi_turn_dialogue, zero_pad_sequences
 
 
-def preprocess_data(data, input_template=None, input_key=None, output_key=None):
-    system_prompt = None
-
+def preprocess_data(data, input_template=None, input_key=None, output_key=None, apply_chat_template=None):
     # custom dataset
-    if input_key and output_key:
+    if input_key:
         prompt = data[input_key]
         response = data[output_key]
+
+        if apply_chat_template:
+            prompt = apply_chat_template(data[input_key][:-1], tokenize=False, add_generation_prompt=True)
+            response = apply_chat_template(data[input_key], tokenize=False)[len(prompt) :]
+            input_template = None
     else:
-        # pvduy/sharegpt_alpaca_oa_vicuna_format
-        if exist_and_not_none(data, "prompt") and exist_and_not_none(data, "label"):
-            prompt = data["prompt"].replace("USER:", "").replace("ASSISTANT:", "")
-            response = data["label"].replace("</s>", "")
         # Open-Orca/OpenOrca
-        elif exist_and_not_none(data, "system_prompt") and exist_and_not_none(data, "response"):
-            system_prompt = data["system_prompt"]
-            prompt = data["question"]
+        if exist_and_not_none(data, "system_prompt") and exist_and_not_none(data, "response"):
+            prompt = data["system_prompt"] + " " + data["question"]
             response = data["response"]
         # MaziyarPanahi/WizardLM_evol_instruct_V2_196k
         # jondurbin/airoboros-3.2
-        elif exist_and_not_none(data, "conversations"):
-
-            def process_conversations(lll):
-                result = []
-                for l in lll:
-                    if "human" in l["from"]:
-                        result.append(input_template.format(l["value"]))
-                    elif "system" in l["from"]:
-                        nonlocal system_prompt
-                        system_prompt = l["value"]
-                    else:
-                        result.append(l["value"] + "\n")
-                return "".join(result)
-
-            prompt = process_conversations(data["conversations"][:-1])
+        elif exist_and_not_none(data, "conversations") and isinstance(data["conversations"], list):
+            prompt = process_multi_turn_dialogue(
+                data["conversations"][:-1], input_template=input_template, content_key="value", role_key="from"
+            )
             response = data["conversations"][-1]["value"]
             input_template = None  # do not modified with input template again
         # for batch_inference.py
@@ -51,9 +40,6 @@ def preprocess_data(data, input_template=None, input_key=None, output_key=None):
     # input template
     if input_template:
         prompt = input_template.format(prompt)
-
-    if system_prompt:
-        prompt = system_prompt + "\n" + prompt
     return prompt, response
 
 
@@ -73,7 +59,7 @@ class SFTDataset(Dataset):
         tokenizer: Callable,
         max_length: int,
         strategy,
-        input_template="Human:\n{}\nAssistant:\n",
+        input_template="Human: {}\nAssistant: ",
         pretrain_mode=False,
     ) -> None:
         super().__init__()
@@ -86,9 +72,22 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         input_key = getattr(self.strategy.args, "input_key", None)
         output_key = getattr(self.strategy.args, "output_key", None)
+        output_key = getattr(self.strategy.args, "output_key", None)
+        apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+        if apply_chat_template:
+            apply_chat_template = self.tokenizer.apply_chat_template
+            tokenizer_chat_template = getattr(self.strategy.args, "tokenizer_chat_template", None)
+            if tokenizer_chat_template:
+                self.tokenizer.chat_template = tokenizer_chat_template
 
         for data in tqdm(dataset, disable=not self.strategy.is_rank_0()):
-            prompt, response = preprocess_data(data, None if pretrain_mode else input_template, input_key, output_key)
+            prompt, response = preprocess_data(
+                data,
+                None if pretrain_mode else input_template,
+                input_key,
+                output_key,
+                apply_chat_template=apply_chat_template,
+            )
 
             if not self.pretrain_mode:
                 prompt_token = self.tokenizer(
@@ -122,8 +121,12 @@ class SFTDataset(Dataset):
         prompt = self.prompts[idx]
         response = self.responses[idx]
 
+        text = (prompt + response).rstrip("\n")
+        if not text.endswith(self.tokenizer.eos_token):
+            text += " " + self.tokenizer.eos_token
+
         input_token = self.tokenizer(
-            prompt + response + " " + self.tokenizer.eos_token,
+            text,
             max_length=self.max_length,
             padding=False,
             truncation=True,

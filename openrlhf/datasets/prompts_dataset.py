@@ -1,56 +1,40 @@
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from .utils import exist_and_not_none
+from .utils import exist_and_not_none, process_multi_turn_dialogue
 
 
-def preprocess_data(data, input_template=None, input_key=None) -> str:
-    system_prompt = None
-
+def preprocess_data(data, input_template=None, input_key=None, apply_chat_template=None) -> str:
     # custom dataset
     if input_key:
-        prompt = data[input_key]
+        if apply_chat_template:
+            prompt = apply_chat_template(data[input_key], tokenize=False, add_generation_prompt=True)
+            input_template = None
+        else:
+            prompt = data[input_key]
     else:
+        # Open-Orca/OpenOrca
+        if exist_and_not_none(data, "system_prompt") and exist_and_not_none(data, "response"):
+            prompt = data["system_prompt"] + " " + data["question"]
         # Dahoas/full-hh-rlhf
-        if exist_and_not_none(data, "prompt"):
+        elif exist_and_not_none(data, "prompt"):
             prompt = data["prompt"]
             # tasksource/oasst1_pairwise_rlhf_reward
             if prompt.startswith("prompter:"):
                 prompt = (
-                    prompt.replace("prompter:", "\nHuman:\n").replace("assistant:", "\nAssistant:\n")
-                    + "\nAssistant:\n"
+                    prompt.replace("prompter:", "\nHuman: ").replace("assistant:", "\nAssistant: ") + "\nAssistant: "
                 )
             input_template = None  # do not modified with input template again
-        # Open-Orca/OpenOrca
-        elif exist_and_not_none(data, "system_prompt") and exist_and_not_none(data, "response"):
-            system_prompt = data["system_prompt"]
-            prompt = data["question"]
-        # lmsys/chatbot_arena_conversations
-        elif exist_and_not_none(data, "winner") and exist_and_not_none(data, "conversation_a"):
-
-            def process_chatbot_arena_conversations(lll):
-                result = []
-                for l in lll:
-                    if "user" in l["role"]:
-                        result.append(input_template.format(l["content"]))
-                    else:
-                        result.append(l["content"] + "\n")
-                return "".join(result)
-
-            prompt = data["conversation_a"][:-1]
-            prompt = process_chatbot_arena_conversations(prompt)
+        # RLHFlow/prompt-collection-v0.1
+        elif exist_and_not_none(data, "context_messages") and isinstance(data["context_messages"], list):
+            prompt = data["context_messages"]
+            prompt = process_multi_turn_dialogue(prompt, input_template=input_template)
             input_template = None  # do not modified with input template again
-        # openai/webgpt_comparisons
-        elif exist_and_not_none(data, "question") and exist_and_not_none(data, "answer_1"):
-            prompt = data["question"]["full_text"]
         else:
             raise ValueError("Unknown prompts dataset")
 
     # input template
     if input_template:
         prompt = input_template.format(prompt)
-
-    if system_prompt:
-        prompt = system_prompt + "\n" + prompt
     return prompt
 
 
@@ -69,17 +53,20 @@ class PromptDataset(Dataset):
         dataset,
         tokenizer,
         strategy,
-        input_template="Human:\n{}\nAssistant:\n",
+        input_template="Human: {}\nAssistant: ",
     ) -> None:
         super().__init__()
         self.strategy = strategy
         self.tokenizer = tokenizer
         self.input_template = input_template
         input_key = getattr(self.strategy.args, "input_key", None)
+        apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+        if apply_chat_template:
+            apply_chat_template = self.tokenizer.apply_chat_template
 
         self.prompts = []
         for data in tqdm(dataset, disable=not self.strategy.is_rank_0()):
-            prompt = preprocess_data(data, input_template, input_key)
+            prompt = preprocess_data(data, input_template, input_key, apply_chat_template)
             self.prompts.append(prompt)
 
     def __len__(self):
