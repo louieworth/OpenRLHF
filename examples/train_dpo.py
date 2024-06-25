@@ -66,8 +66,11 @@ def train(args):
         max_count=args.max_samples,
         stopping_strategy="all_exhausted",
     )
-    train_data = train_data.select(range(min(args.max_samples, len(train_data))))
-    eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
+    data_length = float('inf')
+    if args.sanity_check:
+        data_length = 1000
+    train_data = train_data.select(range(min(args.max_samples, min(len(train_data), data_length))))
+    eval_data = eval_data.select(range(min(args.max_samples, min(len(eval_data), data_length))))
     train_dataset = RewardDataset(
         train_data, tokenizer, args.max_len, strategy, input_template=args.input_template, is_dpo=True
     )
@@ -172,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_rank", type=int, default=0)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--target_modules", type=str, nargs="*", default="all-linear")
+    parser.add_argument("--sanity_check", action="store_true", default=False)
     parser.add_argument("--lora_dropout", type=float, default=0)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true")
 
@@ -190,12 +194,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_run_name",
         type=str,
-        default="exp_%s" % datetime.now().strftime("%m%dT%H:%M"),
+        default=None,
     )
 
     args = parser.parse_args()
 
     if args.ref_pretrain is None or args.ref_pretrain == "":
         args.ref_pretrain = args.pretrain
+    
+    if args.wandb_run_name is None:
+        args.wandb_run_name = "exp_%s" % datetime.now().strftime("%m%dT%H:%M")
+    else:
+        args.wandb_run_name += "_%s" % datetime.now().strftime("%m%dT%H:%M")
 
     train(args)
