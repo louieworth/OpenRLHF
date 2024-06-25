@@ -4,13 +4,13 @@ set -x
 
 
 mkdir -p /data02/wenhao/jl/ckpt/pythia_410m/tldr/vanilla_iter_dpo
-GENERATE_OUTPUT=/data02/wenhao/jl//ckpt/pythia_410m/tldr/vanilla_iter_dpo/generate.jsonl
-RM_OUTPUT=/data02/wenhao/jl//ckpt/pythia_410m/tldr/vanilla_iter_dpo/rm.jsonl
+GENERATE_OUTPUT=/data02/wenhao/jl/ckpt/pythia_410m/tldr/vanilla_iter_dpo/generate.jsonl
+RM_OUTPUT=/data02/wenhao/jl/ckpt/pythia_410m/tldr/vanilla_iter_dpo/rm.jsonl
 MODEL_OUTPUT_PATH=/data02/wenhao/jl//ckpt/pythia_410m/tldr/vanilla_iter_dpo/ckpt
 ITER_LOG_PATH=null
 
 TRAINING_ITERS=2
-ROLLOUT_BATCH_SIZE=10240
+ROLLOUT_BATCH_SIZE=1000
 
 POLICY_MODEL_PATH=EleutherAI/pythia-410m
 REWARD_MODEL_PATH=sfairXC/FsfairX-LLaMA3-RM-v0.1
