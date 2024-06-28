@@ -64,7 +64,7 @@ def batch_generate_vllm(args):
     else:
         prompts_data = eval_data
         
-    length = min(len(prompts_data), 1000)
+    length = min(len(prompts_data), args.rollout_batch_size)
     random_indices = random.sample(range(len(prompts_data)), length)
     prompts_data = prompts_data.select(random_indices)
 
@@ -318,7 +318,7 @@ def batch_rm_acc(args):
         dataset = eval_data
     else:
         dataset = train_data
-    length = min(len(dataset), 1000)
+    length = min(len(dataset), args.rollout_batch_size)
     random_indices = random.sample(range(len(dataset)), length)
     dataset = dataset.select(random_indices)
 

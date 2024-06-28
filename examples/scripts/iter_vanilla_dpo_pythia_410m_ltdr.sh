@@ -7,7 +7,7 @@ mkdir -p $base_dir
 ITER_LOG_PATH=null
 AVAILABLE_GPUS="4,5,6,7"
 
-TRAINING_ITERS=1
+TRAINING_ITERS=4
 BEST_OF_N=2
 ROLLOUT_BATCH_SIZE=90000
 TEMPERATURE=1
@@ -26,7 +26,7 @@ checkSuccess() {
 
 export PATH=$HOME/.local/bin/:$PATH
 
-iter=0
+iter=1
 if [ -f $ITER_LOG_PATH ]; then
     iter=$(cat $ITER_LOG_PATH)
 fi
@@ -35,7 +35,7 @@ while (($iter < $TRAINING_ITERS)); do
     echo "Iter: $iter"
     # Create unique output paths for each iteration
     GENERATE_OUTPUT="${base_dir}/iter_${iter}_generate.jsonl"
-    RM_OUTPUT="${base_dir}/iter_${iter}_rm.jsonl"
+    RM_OUTPUT="${base_dir}/iter_0_rm.jsonl"
     MODEL_OUTPUT_PATH="${base_dir}/iter_${iter}_ckpt"
 
     # Use latest model if past first iteration
@@ -43,39 +43,39 @@ while (($iter < $TRAINING_ITERS)); do
         POLICY_MODEL_PATH="${base_dir}/iter_$((iter - 1))_ckpt"
     fi
 
-    generate_commands="examples/batch_inference.py \
-        --eval_task generate_vllm \
-        --pretrain $POLICY_MODEL_PATH \
-        --max_new_tokens 48 \
-        --dataset $DATASET_PATH \
-        --dataset_probs 1.0 \
-        --temperature $TEMPERATURE \
-        --tp_size 4 \
-        --best_of_n $BEST_OF_N \
-        --max_num_seqs 128 \
-        --iter $iter \
-        --rollout_batch_size $ROLLOUT_BATCH_SIZE \
-        --output_path $GENERATE_OUTPUT"
-    echo $generate_commands
+    # generate_commands="examples/batch_inference.py \
+    #     --eval_task generate_vllm \
+    #     --pretrain $POLICY_MODEL_PATH \
+    #     --max_new_tokens 48 \
+    #     --dataset $DATASET_PATH \
+    #     --dataset_probs 1.0 \
+    #     --temperature $TEMPERATURE \
+    #     --tp_size 4 \
+    #     --best_of_n $BEST_OF_N \
+    #     --max_num_seqs 128 \
+    #     --iter $iter \
+    #     --rollout_batch_size $ROLLOUT_BATCH_SIZE \
+    #     --output_path $GENERATE_OUTPUT"
+    # echo $generate_commands
     
-    CUDA_VISIBLE_DEVICES=$AVAILABLE_GPUS python $generate_commands
-    checkSuccess "GENERATE"
+    # CUDA_VISIBLE_DEVICES=$AVAILABLE_GPUS python $generate_commands
+    # checkSuccess "GENERATE"
 
-    get_rewards_commands="examples/batch_inference.py \
-        --eval_task rm \
-        --pretrain $REWARD_MODEL_PATH \
-        --bf16 \
-        --max_len 2048 \
-        --dataset $GENERATE_OUTPUT \
-        --dataset_probs 1.0 \
-        --zero_stage 0 \
-        --post_processor iter_dpo \
-        --micro_batch_size 8 \
-        --output_path $RM_OUTPUT"
-    echo $get_rewards_commands
+    # get_rewards_commands="examples/batch_inference.py \
+    #     --eval_task rm \
+    #     --pretrain $REWARD_MODEL_PATH \
+    #     --bf16 \
+    #     --max_len 2048 \
+    #     --dataset $GENERATE_OUTPUT \
+    #     --dataset_probs 1.0 \
+    #     --zero_stage 0 \
+    #     --post_processor iter_dpo \
+    #     --micro_batch_size 8 \
+    #     --output_path $RM_OUTPUT"
+    # echo $get_rewards_commands
     
-    deepspeed --include localhost:$AVAILABLE_GPUS $get_rewards_commands
-    checkSuccess "RM"
+    # deepspeed --include localhost:$AVAILABLE_GPUS $get_rewards_commands
+    # checkSuccess "RM"
 
     dpo_commands="examples/train_dpo.py \
         --max_len 2048 \

@@ -1,6 +1,7 @@
 import json
 import csv
 import argparse
+import numpy as np
 ####################
 # Dataset formulate = {"prompt": xxx, "response": xxx, "reward": xxx}
 ####################
@@ -27,8 +28,9 @@ def compare_rewards(file1, file2, output_path, jsonl_output_path):
     ties = 0
     total_comparisons = len(rewards_1)
 
+    avg_model1_performance = sum(entry[1] for entry in rewards_1.values()) / total_comparisons
     avg_model2_performance = sum(entry[1] for entry in rewards_2.values()) / total_comparisons
-    tie_threshold = avg_model2_performance * 0.05
+    tie_threshold = np.abs(avg_model2_performance) * 0.1
 
     for prompt, (response1, reward1) in rewards_1.items():
         response2, reward2 = rewards_2[prompt]
@@ -42,7 +44,7 @@ def compare_rewards(file1, file2, output_path, jsonl_output_path):
             "reward2": reward2
         })
 
-        if tie_threshold <= margin <= tie_threshold:
+        if -tie_threshold <= margin <= tie_threshold:
             ties += 1
         elif margin > 0:
             model2_wins += 1
@@ -50,8 +52,7 @@ def compare_rewards(file1, file2, output_path, jsonl_output_path):
     model2_winrate = model2_wins / total_comparisons
     tie_rate = ties / total_comparisons
     loss_rate = 1 - model2_winrate - tie_rate
-    avg_model1_performance = sum(entry[1] for entry in rewards_1.values()) / total_comparisons
-
+    
     with open(output_path, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(["Reward1", "Reward2", "Margin"])
