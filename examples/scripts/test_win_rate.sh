@@ -14,14 +14,13 @@ ROLLOUT_BATCH_SIZE=1000
 TEMPERATURE=1
 
 base_dir="/data02/wenhao/jl/ckpt/pythia_410m/tldr"
-eval_dir="${base_dir}/ArmoRM_eval"
+eval_dir="${base_dir}/Llama3-8B_RM_eval"
 mkdir -p $eval_dir
 
-pythia_410m/tldr/ArmoRM_iter_dpo
-POLICY_1_MODEL_PATH="ArmoRM_iter_dpo/iter_0_ckpt"
-POLICY_2_MODEL_PATH="ArmoRM_vanilla_iter_dpo/iter_0_ckpt"
-REWARD_MODEL_PATH="RLHFlow/ArmoRM-Llama3-8B-v0.1"
-DATASET_PATH="mnoukhov/openai_summarize_comparisons_tldrprompt_relabel1b"
+POLICY_1_MODEL_PATH="Llama3-8B_RM_iter_dpo/iter_0_ckpt"
+POLICY_2_MODEL_PATH="Llama3-8B_RM_vanilla_iter_dpo/iter_0_ckpt"
+REWARD_MODEL_PATH="/data02/wenhao/jl/ckpt/rm/rm-tldr-Meta-Llama-3-8B-Instruct"
+DATASET_PATH="when2rl/tldr-summarisation-preferences_reformatted"
 
 POLICY_1_MODEL_FILENAME=$(echo "${POLICY_1_MODEL_PATH}" | tr '/' '_')
 POLICY_2_MODEL_FILENAME=$(echo "${POLICY_2_MODEL_PATH}" | tr '/' '_')
@@ -112,7 +111,8 @@ checkSuccess "RM"
 win_rate_commands="examples/win_rate.py \
     --file1 $POLICY_1_RM_OUTPUT \
     --file2 $POLICY_2_RM_OUTPUT \
-    --output ${eval_dir}/${POLICY_2_MODEL_FILENAME}_win_rate_over_${POLICY_1_MODEL_FILENAME}.csv"
+    --output ${eval_dir}/${POLICY_2_MODEL_FILENAME}_win_rate_over_${POLICY_1_MODEL_FILENAME}.csv \
+    --jsonl_output ${eval_dir}/${POLICY_2_MODEL_FILENAME}_win_rate_over_${POLICY_1_MODEL_FILENAME}.jsonl"
 echo $get_rewards_commands
 python $win_rate_commands
 checkSuccess "WIN_RATE"

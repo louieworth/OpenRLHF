@@ -3,6 +3,7 @@ import os
 from datetime import timedelta
 import logging
 import random
+from openrlhf.datasets import RewardDataset
 
 import jsonlines
 import torch
@@ -60,13 +61,12 @@ def batch_generate_vllm(args):
 
     if not args.eval:
         prompts_data = train_dataset
-        if args.sanity_check:
-            prompts_data = prompts_data.select(range(1000))
-        else:
-            prompts_data = prompts_data.select(range(min(args.max_samples, args.rollout_batch_size, len(prompts_data))))
     else:
         prompts_data = eval_data
-        prompts_data = prompts_data.select(range(min(args.rollout_batch_size , len(prompts_data))))
+        
+    length = min(len(prompts_data), 1000)
+    random_indices = random.sample(range(len(prompts_data)), length)
+    prompts_data = prompts_data.select(random_indices)
 
 
     prompts_dataset = PromptDataset(prompts_data, tokenizer, dummy_strategy, input_template=args.input_template)
@@ -286,7 +286,7 @@ def batch_rm_inference(args):
 def batch_rm_acc(args):
     # configure strategy
     strategy = get_strategy(args)
-    strategy.setup_distributed(timeout=timedelta(minutes=180))
+    # strategy.setup_distributed(timeout=timedelta(minutes=180))
 
     # configure model
     # load huggingface model/config
@@ -321,68 +321,33 @@ def batch_rm_acc(args):
     length = min(len(dataset), 1000)
     random_indices = random.sample(range(len(dataset)), length)
     dataset = dataset.select(random_indices)
-    
-    chosen_dataset = SFTDataset(
-        dataset, tokenizer, args.max_len, strategy,
-         pretrain_mode=False, input_key='prompt', output_key='chosen',
-         input_template=args.input_template
-    )
-    rejected_dataset = SFTDataset(
-        dataset, tokenizer, args.max_len, strategy,
-         pretrain_mode=False, input_key='prompt', output_key='rejected',
-         input_template=args.input_template
-    )
-    ############################
-    chosen_dataloader = strategy.setup_dataloader(
-        chosen_dataset, args.micro_batch_size, True, False, chosen_dataset.collate_fn, drop_last=False
-    )
-    chosen_pbar = tqdm(
-        chosen_dataloader,
-        disable=not strategy.is_rank_0(),
-    )
 
-    dist.barrier()
+    eval_dataset = RewardDataset(dataset, tokenizer, args.max_len, strategy, input_template=args.input_template)
 
-    output_dataset = {}
+    eval_dataloader = strategy.setup_dataloader(
+        eval_dataset, 8, True, False, eval_dataset.collate_fn)
+
     with torch.no_grad():
-        for _, input_ids, attention_masks, info in chosen_pbar:
-            input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
-            attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
-            rewards = model(input_ids, attention_masks)
-            for prompt, output, reward in zip(info["input"], info["output"], rewards):
-                output_dataset[prompt] = {"input": prompt, "chosen": output, "chosen_reward": reward.item()}
+        acc = 0
+        for chosen_ids, c_mask, reject_ids, r_mask, margin in eval_dataloader:
+            chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
+            c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
+            reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
+            r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
+            margin = torch.tensor(margin).to(torch.cuda.current_device())
 
-            dist.barrier()
-    ######################
-    rejected_dataloader = strategy.setup_dataloader(
-        rejected_dataset, args.micro_batch_size, True, False, rejected_dataset.collate_fn, drop_last=False
-    )
-    rejected_pbar = tqdm(
-        rejected_dataloader,
-        disable=not strategy.is_rank_0(),
-    )
+            chosen_reward = model(chosen_ids, c_mask)
+            reject_reward = model(reject_ids, r_mask)
+            acc += (chosen_reward > reject_reward).float().mean().item()
 
-    dist.barrier()
-    correct_account = 0
-    with torch.no_grad():
-        for _, input_ids, attention_masks, info in rejected_pbar:
-            input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
-            attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
-            rewards = model(input_ids, attention_masks)
-            for prompt, output, reward in zip(info["input"], info["output"], rewards):
-                # output_dataset.append({"input": prompt, "rejected": output, "reward": reward.item()})
-                output_dataset[prompt]["rejected"] = output
-                output_dataset[prompt]["rejected_reward"] = reward.item()
-                if output_dataset[prompt]['chosen_reward'] > output_dataset[prompt]['rejected_reward']:
-                    correct_account += 1
-
-            dist.barrier()
-    
-    print('--------------------------------------------')
-    print(f"dataset: {args.dataset} with eval: {args.eval}")
-    print(f"reward model: {args.pretrain}")
-    print(f"Correct Account: {correct_account} of {length}: {correct_account/length}")
-    print('--------------------------------------------')
+        
+        acc_mean = acc / eval_dataloader.__len__()
+        # if strategy.is_rank_0():
+        print('--------------------------------------------')
+        print(f"dataset: {args.dataset} with eval: {args.eval}")
+        print(f"reward model: {args.pretrain}")
+        print(f"Correct Account: {acc_mean}")
+        print('--------------------------------------------')
 
     
 

@@ -58,12 +58,8 @@ while (($iter < $TRAINING_ITERS)); do
         --output_path $GENERATE_OUTPUT"
     echo $generate_commands
     
-    if [ $iter -eq 0 ] && [ -f "$GENERATE_OUTPUT" ]; then
-        echo "Skipping generation as $GENERATE_OUTPUT already exists."
-    else
-        CUDA_VISIBLE_DEVICES=$AVAILABLE_GPUS python $generate_commands
-        checkSuccess "GENERATE"
-    fi
+    CUDA_VISIBLE_DEVICES=$AVAILABLE_GPUS python $generate_commands
+    checkSuccess "GENERATE"
 
     get_rewards_commands="examples/batch_inference.py \
         --eval_task rm \
@@ -77,6 +73,7 @@ while (($iter < $TRAINING_ITERS)); do
         --micro_batch_size 8 \
         --output_path $RM_OUTPUT"
     echo $get_rewards_commands
+    
     deepspeed --include localhost:$AVAILABLE_GPUS $get_rewards_commands
     checkSuccess "RM"
 

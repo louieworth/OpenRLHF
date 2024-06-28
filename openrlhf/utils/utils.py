@@ -113,8 +113,10 @@ def blending_datasets(
                 eval_data = data["validation"].select(range(min(max_count01, len(data["validation"]))))
             elif "test_prefs" in data:  
                 eval_data = data["test_prefs"].select(range(min(max_count01, len(data["test_prefs"]))))
+            elif "train" in data:
+                eval_data = data["train"].select(range(min(max_count01, int(len(data["train"]) * 0.01))))
             else:
-                raise Exception(f"Dataset Name {dataset}: No eval data")
+                eval_data = data.select(range(min(int(max_count01), int(len(data) * 0.01))))
             eval_data_list.append(eval_data)
 
     # merge datasets

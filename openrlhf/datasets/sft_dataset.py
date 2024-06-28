@@ -99,7 +99,7 @@ class SFTDataset(Dataset):
                 output_key,
                 apply_chat_template=apply_chat_template,
             )
-
+            
             if not self.pretrain_mode:
                 prompt_token = self.tokenizer(
                     prompt,
@@ -147,6 +147,7 @@ class SFTDataset(Dataset):
         # to avoid EOS_token truncation
         input_token["input_ids"][0][-1] = self.tokenizer.eos_token_id
         input_token["attention_mask"][0][-1] = True
+
         return prompt_ids_len, input_token["input_ids"], input_token["attention_mask"], info
 
     def collate_fn(self, item_list):

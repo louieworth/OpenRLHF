@@ -55,12 +55,10 @@ def preprocess_data(
             prompt = data["prompt"] if exist_and_not_none(data, "prompt") else ""
             chosen = data["chosen"]
             rejected = data["rejected"]
-            if "role" in chosen[0]:
-                ####################
-                # check the dataset whether requiring this formulate: \n\nHuman: <prompt>\n\nAssistant: <response>
-                ####################
-                chosen = chosen[1]["content"]
-                rejected = rejected[1]["content"]
+            if type(chosen) == list:
+                chosen = process_multi_turn_dialogue(chosen)
+                rejected = process_multi_turn_dialogue(rejected)
+                input_template = None  # do not modified with input template again
 
             if prompt and prompt.startswith("prompter:"):
                 prompt = (
