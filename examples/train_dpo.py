@@ -69,8 +69,8 @@ def train(args):
     data_length = float('inf')
     if args.sanity_check:
         data_length = 1000
-    train_data = train_data.select(range(min(args.max_samples, min(len(train_data), data_length))))
-    eval_data = eval_data.select(range(min(args.max_samples, min(len(eval_data), data_length))))
+    train_data = train_data.select(range(min(args.max_samples, args.rollout_batch_size, min(len(train_data), data_length))))
+    eval_data = eval_data.select(range(min(args.max_samples, args.rollout_batch_size, min(len(eval_data), data_length))))
     train_dataset = RewardDataset(
         train_data, tokenizer, args.max_len, strategy, input_template=args.input_template, is_dpo=True
     )
@@ -168,6 +168,7 @@ if __name__ == "__main__":
     parser.add_argument("--adam_offload", action="store_true", default=False)
     parser.add_argument("--flash_attn", action="store_true", default=False)
     parser.add_argument("--max_samples", type=int, default=1000000)
+    parser.add_argument("--rollout_batch_size", type=int, default=1000000)
     parser.add_argument("--aux_loss_coef", type=float, default=0)
     parser.add_argument("--grad_accum_dtype", type=str, default=None)
     parser.add_argument("--disable_trace_cache", action="store_true", default=False)

@@ -1,6 +1,8 @@
 import argparse
 import os
 from datetime import timedelta
+import logging
+import random
 
 import jsonlines
 import torch
@@ -46,21 +48,26 @@ def batch_generate_vllm(args):
         repetition_penalty=args.repetition_penalty,
     )
 
-    prompts_data = blending_datasets(
+    
+    train_dataset, eval_data = blending_datasets(
         args.dataset,
         args.dataset_probs,
         dummy_strategy,
         args.seed,
-        return_eval=False,
+        return_eval=True,
         max_count=args.max_samples,
     )
-    if args.iter is None:
-        prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
+
+    if not args.eval:
+        prompts_data = train_dataset
+        if args.sanity_check:
+            prompts_data = prompts_data.select(range(1000))
+        else:
+            prompts_data = prompts_data.select(range(min(args.max_samples, args.rollout_batch_size, len(prompts_data))))
     else:
-        # for iterative generation
-        start_idx = args.iter * args.rollout_batch_size
-        end_idx = start_idx + args.rollout_batch_size
-        prompts_data = prompts_data.select(range(start_idx, min(end_idx, len(prompts_data))))
+        prompts_data = eval_data
+        prompts_data = prompts_data.select(range(min(args.rollout_batch_size , len(prompts_data))))
+
 
     prompts_dataset = PromptDataset(prompts_data, tokenizer, dummy_strategy, input_template=args.input_template)
     prompts = list(prompts_dataset)
@@ -276,6 +283,109 @@ def batch_rm_inference(args):
         with jsonlines.open(args.output_path, mode="w") as writer:
             writer.write_all(output_dataset)
 
+def batch_rm_acc(args):
+    # configure strategy
+    strategy = get_strategy(args)
+    strategy.setup_distributed(timeout=timedelta(minutes=180))
+
+    # configure model
+    # load huggingface model/config
+    model = get_llm_for_sequence_regression(
+        args.pretrain,
+        "reward",
+        normalize_reward=True,
+        use_flash_attention_2=args.flash_attn,
+        bf16=args.bf16,
+        head_prefix=args.head_prefix,
+    )
+
+    # configure tokenizer
+    tokenizer = get_tokenizer(args.pretrain, model, "left", strategy, use_fast=not args.disable_fast_tokenizer)
+
+    # prepare models
+    model = strategy.prepare(model)
+    model.eval()
+
+    train_data, eval_data = blending_datasets(
+        args.dataset,
+        args.dataset_probs,
+        strategy,
+        args.seed,
+        return_eval=True,
+        max_count=args.max_samples,
+    )
+    if args.eval:
+        dataset = eval_data
+    else:
+        dataset = train_data
+    length = min(len(dataset), 1000)
+    random_indices = random.sample(range(len(dataset)), length)
+    dataset = dataset.select(random_indices)
+    
+    chosen_dataset = SFTDataset(
+        dataset, tokenizer, args.max_len, strategy,
+         pretrain_mode=False, input_key='prompt', output_key='chosen',
+         input_template=args.input_template
+    )
+    rejected_dataset = SFTDataset(
+        dataset, tokenizer, args.max_len, strategy,
+         pretrain_mode=False, input_key='prompt', output_key='rejected',
+         input_template=args.input_template
+    )
+    ############################
+    chosen_dataloader = strategy.setup_dataloader(
+        chosen_dataset, args.micro_batch_size, True, False, chosen_dataset.collate_fn, drop_last=False
+    )
+    chosen_pbar = tqdm(
+        chosen_dataloader,
+        disable=not strategy.is_rank_0(),
+    )
+
+    dist.barrier()
+
+    output_dataset = {}
+    with torch.no_grad():
+        for _, input_ids, attention_masks, info in chosen_pbar:
+            input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
+            attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
+            rewards = model(input_ids, attention_masks)
+            for prompt, output, reward in zip(info["input"], info["output"], rewards):
+                output_dataset[prompt] = {"input": prompt, "chosen": output, "chosen_reward": reward.item()}
+
+            dist.barrier()
+    ######################
+    rejected_dataloader = strategy.setup_dataloader(
+        rejected_dataset, args.micro_batch_size, True, False, rejected_dataset.collate_fn, drop_last=False
+    )
+    rejected_pbar = tqdm(
+        rejected_dataloader,
+        disable=not strategy.is_rank_0(),
+    )
+
+    dist.barrier()
+    correct_account = 0
+    with torch.no_grad():
+        for _, input_ids, attention_masks, info in rejected_pbar:
+            input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
+            attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
+            rewards = model(input_ids, attention_masks)
+            for prompt, output, reward in zip(info["input"], info["output"], rewards):
+                # output_dataset.append({"input": prompt, "rejected": output, "reward": reward.item()})
+                output_dataset[prompt]["rejected"] = output
+                output_dataset[prompt]["rejected_reward"] = reward.item()
+                if output_dataset[prompt]['chosen_reward'] > output_dataset[prompt]['rejected_reward']:
+                    correct_account += 1
+
+            dist.barrier()
+    
+    print('--------------------------------------------')
+    print(f"dataset: {args.dataset} with eval: {args.eval}")
+    print(f"reward model: {args.pretrain}")
+    print(f"Correct Account: {correct_account} of {length}: {correct_account/length}")
+    print('--------------------------------------------')
+
+    
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -300,6 +410,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_key", type=str, default=None)
     parser.add_argument("--output_key", type=str, default=None)
     parser.add_argument("--apply_chat_template", action="store_true", default=False)
+    parser.add_argument("--sanity_check", action="store_true", default=False)
+    parser.add_argument("--eval", action="store_true", default=False)
 
     # for generation
     parser.add_argument("--ta_prompt", type=str, default=None)
@@ -338,5 +450,7 @@ if __name__ == "__main__":
         batch_generate_vllm(args)
     elif args.eval_task and args.eval_task == "rm":
         batch_rm_inference(args)
+    elif args.eval_task and args.eval_task == "rm_acc":
+        batch_rm_acc(args)
     else:
         print("Invalid or missing '--eval_task' argument. Please specify either 'generate' or 'rm'.")

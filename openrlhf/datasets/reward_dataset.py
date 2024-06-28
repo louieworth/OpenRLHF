@@ -1,11 +1,35 @@
 from typing import Callable
-
+import multiprocessing
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from .utils import exist_and_not_none, process_multi_turn_dialogue, zero_pad_sequences
 
+def extract_dialogue(input_text):
+    # Split the input by lines and initialize variables
+    lines = input_text.strip().split("\n\n")
+    dialogue_list = []
+
+    # Iterate through each line and extract the dialogue
+    for line in lines:
+        # Check if the line starts with "Human" or "Assistant" and split accordingly
+        if line.startswith("Human:"):
+            role = "user"
+            content = line.replace("Human: ", "").strip()
+        elif line.startswith("Assistant:"):
+            role = "assistant"
+            content = line.replace("Assistant: ", "").strip()
+        else:
+            # If the line doesn't start with "Human" or "Assistant", it's part of the previous message's content
+            # Append it to the last message's content
+            dialogue_list[-1]["content"] += "\n\n" + line.strip()
+            continue
+
+        # Append the extracted dialogue piece to the list
+        dialogue_list.append({"role": role, "content": content})
+
+    return dialogue_list
 
 def preprocess_data(
     data, input_template=None, prompt_key=None, chosen_key=None, rejected_key=None, apply_chat_template=None
@@ -28,14 +52,21 @@ def preprocess_data(
     else:
         # Anthropic/hh-rlhf
         if exist_and_not_none(data, "chosen") and exist_and_not_none(data, "rejected"):
-            # tasksource/oasst1_pairwise_rlhf_reward
             prompt = data["prompt"] if exist_and_not_none(data, "prompt") else ""
+            chosen = data["chosen"]
+            rejected = data["rejected"]
+            if "role" in chosen[0]:
+                ####################
+                # check the dataset whether requiring this formulate: \n\nHuman: <prompt>\n\nAssistant: <response>
+                ####################
+                chosen = chosen[1]["content"]
+                rejected = rejected[1]["content"]
+
             if prompt and prompt.startswith("prompter:"):
                 prompt = (
                     prompt.replace("prompter:", "\nHuman: ").replace("assistant:", "\nAssistant: ") + "\nAssistant: "
                 )
-            chosen = data["chosen"]
-            rejected = data["rejected"]
+
         # lmsys/chatbot_arena_conversations
         elif exist_and_not_none(data, "winner") and exist_and_not_none(data, "conversation_a"):
             prompt = ""
@@ -103,7 +134,7 @@ class RewardDataset(Dataset):
         apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
-
+        
         for data in tqdm(dataset, disable=not self.strategy.is_rank_0()):
             prompt, chosen, reject, margin = preprocess_data(
                 data, input_template, prompt_key, chosen_key, rejected_key, apply_chat_template
@@ -126,7 +157,7 @@ class RewardDataset(Dataset):
                     self.prompt_ids_lens.append(prompt_ids_len)
             else:
                 self.margins.append(margin)
-
+            
             self.prompts.append(prompt)
             self.chosens.append(chosen)
             self.rejects.append(reject)

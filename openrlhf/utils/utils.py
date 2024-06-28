@@ -95,22 +95,26 @@ def blending_datasets(
             data = load_dataset(dataset)
         else:
             raise Exception(f"Dataset Name {dataset}: Format error")
-
+        
         if "train" in data:
             train_data_list.append(data["train"].select(range(min(max_count, len(data["train"])))))
+        elif "train_prefs" in data:  # for HuggingFaceH4/ultrafeedback_binarized
+            train_data_list.append(data["train_prefs"].select(range(min(max_count, len(data["train_prefs"])))))
         else:
             train_data_list.append(data.select(range(min(max_count, len(data)))))  # train will contains eval? TODO
 
         if return_eval:
-            max_count01 = int(max_count * 0.1)
+            
+            # max_count01 = int(max_count * 0.1)
+            max_count01 = min(int(len(data['train']) * 0.1), 5000)
             if "test" in data:
                 eval_data = data["test"].select(range(min(max_count01, len(data["test"]))))
             elif "validation" in data:
                 eval_data = data["validation"].select(range(min(max_count01, len(data["validation"]))))
-            elif "train" in data:
-                eval_data = data["train"].select(range(min(max_count01, int(len(data["train"]) * 0.01))))
+            elif "test_prefs" in data:  
+                eval_data = data["test_prefs"].select(range(min(max_count01, len(data["test_prefs"]))))
             else:
-                eval_data = data.select(range(min(int(max_count01), int(len(data) * 0.01))))
+                raise Exception(f"Dataset Name {dataset}: No eval data")
             eval_data_list.append(eval_data)
 
     # merge datasets

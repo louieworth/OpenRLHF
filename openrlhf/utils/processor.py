@@ -62,7 +62,7 @@ def iterative_dpo_processor(args, objs):
         output = obj["output"]
         reward = float(obj["reward"])
 
-        if input not in out:
+        if input not in out:    
             out[input] = {
                 "output": output,
                 "chosen": output,
@@ -89,10 +89,37 @@ def iterative_dpo_processor(args, objs):
     ]
 
 
+def iterative_dpo_eval_processor(args, objs):
+    out = {}
+    for obj in tqdm(objs, desc=f"Iterative DPO process...."):
+        input = obj["input"]
+        output = obj["output"]
+        reward = float(obj["reward"])
+
+        if input not in out:    
+            out[input] = {
+                "output": output,
+                "response": output,
+                "reward": reward
+            }
+        elif reward > out[input]["reward"]:
+            out[input]["reward"] = reward
+            out[input]["response"] = output
+    return [
+        {
+            "prompt": k,
+            "response": v["response"],
+            "reward": v["reward"]
+        }
+        for k, v in out.items()
+    ]
+
+
 PROCESSORS = {
     "rs": rejection_sampling_processor,
     "ca": conditional_sft_processor,
     "iter_dpo": iterative_dpo_processor,
+    "eval": iterative_dpo_eval_processor
 }
 
 

@@ -1,5 +1,5 @@
 from typing import Callable
-
+import warnings
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -8,10 +8,12 @@ from .utils import exist_and_not_none, process_multi_turn_dialogue, zero_pad_seq
 
 def preprocess_data(data, input_template=None, input_key=None, output_key=None, apply_chat_template=None):
     # custom dataset
+    
     if input_key:
         prompt = data[input_key]
         response = data[output_key]
-
+        if "role" in response[0]:
+            response = response[1]["content"]
         if apply_chat_template:
             prompt = apply_chat_template(data[input_key][:-1], tokenize=False, add_generation_prompt=True)
             response = apply_chat_template(data[input_key], tokenize=False)[len(prompt) :]
@@ -59,6 +61,8 @@ class SFTDataset(Dataset):
         tokenizer: Callable,
         max_length: int,
         strategy,
+        input_key=None,
+        output_key=None,
         input_template="Human: {}\nAssistant: ",
         pretrain_mode=False,
     ) -> None:
@@ -70,9 +74,16 @@ class SFTDataset(Dataset):
         self.strategy = strategy
         self.pretrain_mode = pretrain_mode
         self.max_length = max_length
-        input_key = getattr(self.strategy.args, "input_key", None)
-        output_key = getattr(self.strategy.args, "output_key", None)
-        output_key = getattr(self.strategy.args, "output_key", None)
+        strategy_input_key = getattr(self.strategy.args, "input_key", None)
+        strategy_output_key = getattr(self.strategy.args, "output_key", None)
+        
+        if input_key is None and strategy_input_key is not None:
+            input_key = strategy_input_key
+            output_key = strategy_output_key
+        if input_key is not None and strategy_input_key is not None:
+            warnings.warn("Both 'input_key' and 'strategy.args.input_key' are set. Using 'input_key' specified in constructor. We force set 'key' as 'strategy'")
+            input_key = strategy_input_key
+            output_key = strategy_output_key
         apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
