@@ -40,6 +40,7 @@ def get_strategy(args):
 
 def blending_datasets(
     datasets,
+    test_dataset,
     probabilities,
     strategy=None,
     seed=42,
@@ -107,7 +108,10 @@ def blending_datasets(
             
             # max_count01 = int(max_count * 0.1)
             max_count01 = min(int(len(data['train']) * 0.1), 5000)
-            if "test" in data:
+            if test_dataset is not None:
+                data_type = os.path.splitext(test_dataset)[1][1:]
+                eval_data = load_dataset(data_type, data_files=test_dataset)
+            elif "test" in data:
                 eval_data = data["test"].select(range(min(max_count01, len(data["test"]))))
             elif "validation" in data:
                 eval_data = data["validation"].select(range(min(max_count01, len(data["validation"]))))

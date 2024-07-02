@@ -74,7 +74,8 @@ def preprocess_data(
             elif data["winner_model_b"] == 1:
                 chosen = data["response_b"]
                 rejected = data["response_a"]
-            input_template = None  # do not modified with input template again
+            else:
+                raise ValueError("Unknown reward dataset")
         # openai/webgpt_comparisons
         elif exist_and_not_none(data, "answer_0") and exist_and_not_none(data, "answer_1"):
             prompt = data["question"]["full_text"]

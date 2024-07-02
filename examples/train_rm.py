@@ -45,12 +45,14 @@ def train(args):
     # prepare for data and dataset
     train_data, eval_data = blending_datasets(
         args.dataset,
+        args.test_dataset,
         args.dataset_probs,
         strategy,
         args.seed,
         max_count=5000000,
         stopping_strategy="all_exhausted",
     )
+    from IPython import embed; embed()
     
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
     eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
@@ -118,7 +120,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrain", type=str, default="bigscience/bloomz-1b7")
     # parser.add_argument('--dataset', type=str, default='Anthropic/hh-rlhf')
-    parser.add_argument("--dataset", type=str, default="Dahoas/full-hh-rlhf")
+    parser.add_argument("--dataset", type=str, default=None)
+    parser.add_argument("--test_dataset", type=str, default=None)
     parser.add_argument("--dataset_probs", type=str, default="1.0", help="sampling probs for datasets")
     parser.add_argument("--save_path", type=str, default="./ckpt")
     parser.add_argument("--save_steps", type=int, default=-1)
