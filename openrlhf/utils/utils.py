@@ -105,12 +105,13 @@ def blending_datasets(
             train_data_list.append(data.select(range(min(max_count, len(data)))))  # train will contains eval? TODO
 
         if return_eval:
-            
-            # max_count01 = int(max_count * 0.1)
+            max_count01 = int(max_count * 0.1)
             max_count01 = min(int(len(data['train']) * 0.1), 5000)
             if test_dataset is not None:
                 data_type = os.path.splitext(test_dataset)[1][1:]
                 eval_data = load_dataset(data_type, data_files=test_dataset)
+                if 'train' in eval_data:
+                    eval_data = eval_data['train']
             elif "test" in data:
                 eval_data = data["test"].select(range(min(max_count01, len(data["test"]))))
             elif "validation" in data:
