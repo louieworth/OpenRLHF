@@ -69,14 +69,12 @@ def preprocess_data(
         elif exist_and_not_none(data, "response_a") and exist_and_not_none(data, "response_b"):
             prompt = prompt[0]
             if data["winner_model_a"] == 1:
-                chosen = data["response_a"][0]
-                rejected = data["response_b"][0]
+                chosen = data["response_a"] 
+                rejected = data["response_b"]
             elif data["winner_model_b"] == 1:
-                chosen = data["response_b"][0]
-                rejected = data["response_a"][0]
-            elif data['winner_model_tie'] == 1:
-                chosen = [data["response_a"][0], data["response_b"][0]]
-                rejected = [data["response_b"][0], data["response_a"][0]]
+                chosen = data["response_b"]
+                rejected = data["response_a"]
+            input_template = None  # do not modified with input template again
         # openai/webgpt_comparisons
         elif exist_and_not_none(data, "answer_0") and exist_and_not_none(data, "answer_1"):
             prompt = data["question"]["full_text"]
