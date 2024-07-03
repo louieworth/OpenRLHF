@@ -67,7 +67,8 @@ def preprocess_data(
 
         # lmsys/lmsys-arena-human-preference-55k
         elif exist_and_not_none(data, "response_a") and exist_and_not_none(data, "response_b"):
-            prompt = prompt[0]
+        
+            prompt = data["prompt"]
             if data["winner_model_a"] == 1:
                 chosen = data["response_a"] 
                 rejected = data["response_b"]
@@ -75,7 +76,10 @@ def preprocess_data(
                 chosen = data["response_b"]
                 rejected = data["response_a"]
             else:
-                raise ValueError("Unknown reward dataset")
+                chosen = data["response_b"]
+                rejected = data["response_a"]
+
+            
         # openai/webgpt_comparisons
         elif exist_and_not_none(data, "answer_0") and exist_and_not_none(data, "answer_1"):
             prompt = data["question"]["full_text"]
@@ -173,7 +177,7 @@ class RewardDataset(Dataset):
             extra = self.prompt_ids_lens[idx]
         else:
             extra = self.margins[idx]
-
+        
         chosen = (prompt + chosen).rstrip("\n")
         if not chosen.endswith(self.tokenizer.eos_token):
             chosen += " " + self.tokenizer.eos_token
@@ -202,11 +206,16 @@ class RewardDataset(Dataset):
         chosen_token["attention_mask"][0][-1] = True
         reject_token["attention_mask"][0][-1] = True
 
+        chosen_length = chosen_token["attention_mask"].int().sum().item()
+        reject_length = reject_token["attention_mask"].int().sum().item()
+
         return (
             chosen_token["input_ids"],
             chosen_token["attention_mask"],
             reject_token["input_ids"],
             reject_token["attention_mask"],
+            chosen_length,
+            reject_length,
             extra,
         )
 
@@ -215,16 +224,20 @@ class RewardDataset(Dataset):
         chosen_masks = []
         reject_ids = []
         rejects_masks = []
+        chosen_lengths = []
+        rejected_lengths = []
         extras = []
-        for chosen_id, chosen_mask, reject_id, rejects_mask, extra in item_list:
+        for chosen_id, chosen_mask, reject_id, rejects_mask, chosen_length, reject_length, extra in item_list:
             chosen_ids.append(chosen_id)
             chosen_masks.append(chosen_mask)
             reject_ids.append(reject_id)
             rejects_masks.append(rejects_mask)
+            chosen_lengths.append(chosen_length)
+            rejected_lengths.append(reject_length)
             extras.append(extra)
 
         chosen_ids = zero_pad_sequences(chosen_ids, value=self.tokenizer.pad_token_id)
         chosen_masks = zero_pad_sequences(chosen_masks)
         reject_ids = zero_pad_sequences(reject_ids, value=self.tokenizer.pad_token_id)
         rejects_masks = zero_pad_sequences(rejects_masks)
-        return chosen_ids, chosen_masks, reject_ids, rejects_masks, extras
+        return chosen_ids, chosen_masks, reject_ids, rejects_masks, chosen_lengths, rejected_lengths, extras

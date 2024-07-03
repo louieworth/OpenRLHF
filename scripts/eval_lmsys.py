@@ -1,11 +1,10 @@
 import subprocess
 import sys
-
 import os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
+import json
 from typing import Optional
 
 import deepspeed
@@ -16,37 +15,59 @@ from peft.tuners.lora import LoraLayer
 from transformers import AutoConfig, AutoModel, BitsAndBytesConfig
 from transformers.deepspeed import HfDeepSpeedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from torch.cuda.amp import autocast
+from transformers import AutoTokenizer
+from datasets import load_dataset, Dataset
 import logging
 
 
-
-import torch
-from torch.utils.data import Dataset
-from torch.cuda.amp import autocast
-import torch
-from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from datasets import Dataset, interleave_datasets, load_dataset
-from transformers import AutoTokenizer,AutoModelForCausalLM
-
 class script_args:
-    pretrain = "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch3"
+    pretrain = "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4"
     test_file = "/data02/wenhao/jl/datasets/lmsys_all.csv"
+    save_path = "scripts/results"
     batch_size = 1
-    max_length = 300
+    max_length = 1024
+    max_total_length = 1024
+    margin = 0.1
     flash_attn = False
     bf16 = True
     disable_fast_tokenizer = False
     device = "cuda:0"
 
 
+def get_gpu_memory_map():
+    """获取当前GPU的显存使用情况"""
+    result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+                            capture_output=True, encoding='utf-8')
+    # 转换为整数列表
+    gpu_memory = [int(x) for x in result.stdout.strip().split('\n')]
+    return gpu_memory
+
+def max_memory_used(device_id):
+    """返回指定设备的最大显存使用量"""
+    return torch.cuda.max_memory_allocated(device=device_id) / (1024 ** 2)  # 转换为MB
+
+
 def init_logger(name: str):
-    # Use the same settings as above for root logger
+    # Create a logger
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
-    logger.addHandler(None)
+    
+    # Create a handler (for example, a console handler)
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    
+    # Create a formatter and set it to the handler
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    # Add the handler to the logger
+    logger.addHandler(handler)
     logger.propagate = False
+    
     return logger
+
+# Initialize logger
 logger = init_logger(__name__)
 
 def get_llm_for_sequence_regression(
@@ -274,19 +295,15 @@ template = "Human: {}\nAssistant: {}"
 
 
 ####################################################################################################
-
-model.eval()
-
 results = []
-tie_results = []
-eval_dataset = load_dataset("csv", data_files=args.test_file)
-eval_dataset = eval_dataset['train']
-length = len(eval_dataset)
-eval_length =  int(length * 0.1)
-# eval_length = 1000
+max_memory_observed = 0
+df = pd.read_csv(args.test_file)
+eval_dataset = Dataset.from_pandas(df)
+length =  len(eval_dataset)
+eval_length = length
 acc = 0
 tie = 0
-for i in tqdm(range(length-eval_length, length)):
+for i in tqdm(range(length - eval_length, length)):
     data = eval_dataset[i]
     id = data["id"]
     prompt = data["prompt"]
@@ -301,12 +318,7 @@ for i in tqdm(range(length-eval_length, length)):
     resp_a = tokenizer.decode(resp_a_tokens['input_ids'], skip_special_tokens=True)
     resp_b = tokenizer.decode(resp_b_tokens['input_ids'], skip_special_tokens=True)
 
-    winner_model_a = data["winner_model_a"]
-    winner_model_b = data["winner_model_b"]
-    winner_tie = data["winner_tie"]
-    assert winner_model_a + winner_model_b + winner_tie == 1
-    if winner_tie == 1:
-        tie += 1
+
     resp_a = template.format(prompt, resp_a)
     resp_b = template.format(prompt, resp_b)
 
@@ -317,7 +329,7 @@ for i in tqdm(range(length-eval_length, length)):
 
     resp_a_token = tokenizer(
             resp_a,
-            max_length=args.max_length,
+            max_length=args.max_total_length,
             padding=False,
             truncation=True,
             return_tensors="pt",
@@ -325,7 +337,7 @@ for i in tqdm(range(length-eval_length, length)):
 
     resp_b_token = tokenizer(
             resp_b,
-            max_length=args.max_length,
+            max_length=args.max_total_length,
             padding=False,
             truncation=True,
             return_tensors="pt",
@@ -347,24 +359,45 @@ for i in tqdm(range(length-eval_length, length)):
             resp_a_ids = resp_a_ids.to(device)
             resp_a_mask = resp_a_mask.to(device)
             resp_a_reward = round(model(resp_a_ids, resp_a_mask).cpu().item(), 2)
-            resp_a_ids.to("cpu")
-            resp_a_mask.to("cpu")
+            current_memory = max_memory_used('cuda:0')
+            if current_memory > max_memory_observed:
+                max_memory_observed = current_memory
+                logger.info(f"id: {id} | Max memory observed: {max_memory_observed} MB")
+            del resp_a_ids, resp_a_mask
         with autocast():
             torch.cuda.empty_cache()
             resp_b_ids = resp_b_ids.to(device)
             resp_b_mask = resp_b_mask.to(device)
             resp_b_reward = round(model(resp_b_ids, resp_b_mask).cpu().item(), 2)
-            resp_b_ids.to("cpu")
-            resp_b_mask.to("cpu")
+            if current_memory > max_memory_observed:
+                max_memory_observed = current_memory
+                logger.info(f"id: {id} | Max memory observed: {max_memory_observed} MB")
+            del resp_b_ids, resp_b_mask
     torch.cuda.empty_cache()
-    
-    if (resp_a_reward > resp_b_reward) and (winner_model_a == 1):
-        acc += 1
-    elif (resp_a_reward < resp_b_reward) and (winner_model_b == 1):
-        acc += 1
+    if data['winner_tie'] == 1:
+        winner = "tie"
+    elif data['winner_model_a'] == 1:
+        winner = "a"
+    elif data['winner_model_b'] == 1:
+        winner = "b"
     else:
-        logging.info(f"tie winner")
-
+        winner = "unknown"
+    reward_gap = resp_a_reward - resp_b_reward
+    winner_model_a, winner_model_b, winner_tie = 0, 0, 0
+    if -args.margin <= reward_gap <= args.margin:
+        winner_tie = 1
+        if data['winner_tie'] == 1:
+            acc += 1
+    elif reward_gap > args.margin:
+        winner_model_a = 1
+        if data['winner_model_a'] == 1:
+            acc += 1
+    else: 
+        winner_model_b = 1
+        if data['winner_model_b'] == 1:
+            acc += 1
+    
+    assert winner_model_a + winner_model_b + winner_tie == 1
 
     result = {
         "id": id, 
@@ -372,19 +405,30 @@ for i in tqdm(range(length-eval_length, length)):
         "resp_b_reward": resp_b_reward,
         "winner_model_a": winner_model_a,
         "winner_model_b": winner_model_b,
-        "winner_tie": winner_tie
+        "winner_tie": winner_tie,
+        "ground_winner": winner,
     }
-    if winner_tie == 1:
-        tie_results.append(result)
 
     results.append(result)
 
+record = {
+    "model": args.pretrain,
+    "data": args.test_file,
+    "margin": args.margin,
+    "length": eval_length,
+    "max_memoery": max_memory_observed,
+    "acc": acc/eval_length,
+}
+jsonl_file_path = f"{args.save_path}/results.jsonl"
+
+
+if not os.path.exists(jsonl_file_path):
+    with open(jsonl_file_path, 'w') as jsonl_file:
+        pass  
+
+with open(jsonl_file_path, 'a') as jsonl_file: 
+    jsonl_file.write(json.dumps(record) + '\n')
+
 df = pd.DataFrame(results)
-df_tie = pd.DataFrame(tie_results)
-
-
-df.to_csv("scripts/results_epoch3.csv", index=False)
-df_tie.to_csv("scripts/tie_results_epoch3.csv", index=False)
-
-print(f"acc: {acc}/{eval_length - tie} = {acc/(eval_length - tie)}")
-print(f"tie total: {tie}")
+df.to_csv(f"{args.save_path}/reward.csv", index=False)
+print(f"Results saved to {jsonl_file_path}")

@@ -52,7 +52,6 @@ def train(args):
         max_count=5000000,
         stopping_strategy="all_exhausted",
     )
-    from IPython import embed; embed()
     
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
     eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
@@ -113,7 +112,7 @@ def train(args):
     trainer.fit(args)
 
     # save model checkpoint after fitting on only rank0
-    strategy.save_model(model, tokenizer, args.save_path)
+    strategy.save_model(model, tokenizer, f"{args.save_path}_final")
 
 
 if __name__ == "__main__":
@@ -171,6 +170,7 @@ if __name__ == "__main__":
     parser.add_argument("--rejected_key", type=str, default=None)
     parser.add_argument("--input_template", type=str, default="Human: {}\nAssistant: ")
     parser.add_argument("--apply_chat_template", action="store_true", default=False)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
     # wandb pamameters
     parser.add_argument("--use_wandb", type=str, default=None)

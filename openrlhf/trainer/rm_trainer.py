@@ -108,11 +108,15 @@ class RewardModelTrainer(ABC):
             self.model.train()
             acc_mean = 0
             loss_mean = 0
-            for chosen_ids, c_mask, reject_ids, r_mask, margin in self.train_dataloader:
+            for chosen_ids, c_mask, reject_ids, r_mask, chosen_lengths, rejected_lengths, margin in self.train_dataloader:
                 chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
                 c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
                 reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
                 r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
+                chosen_lengths = torch.tensor(chosen_lengths).view(-1, ).to(torch.cuda.current_device())
+                rejected_lengths = torch.tensor(rejected_lengths).view(-1, ).to(torch.cuda.current_device())
+                mean_chosen_length = torch.mean(chosen_lengths.float())
+                mean_rejetced_length = torch.mean(rejected_lengths.float())
 
                 if self.margin_loss:
                     margin = torch.tensor(margin).to(torch.cuda.current_device())
@@ -122,6 +126,10 @@ class RewardModelTrainer(ABC):
                 chosen_reward, reject_reward, aux_loss = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask
                 )
+
+                chosen_reward = (chosen_reward / chosen_lengths) * mean_chosen_length
+                reject_reward = (reject_reward / rejected_lengths) * mean_rejetced_length
+                
 
                 # loss function
                 if self.compute_fp32_loss:
@@ -155,7 +163,7 @@ class RewardModelTrainer(ABC):
                 step_bar.update()
                 global_step += 1
             epoch_bar.update()
-
+            self.strategy.save_model(self.model, self.tokenizer, f"{args.save_path}_epoch{epoch}_length_re")
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
 
@@ -195,16 +203,23 @@ class RewardModelTrainer(ABC):
             acc = 0
             rewards = []
             loss_sum = 0
-            for chosen_ids, c_mask, reject_ids, r_mask, margin in eval_dataloader:
+            for chosen_ids, c_mask, reject_ids, r_mask, chosen_lengths, rejected_lengths, margin in eval_dataloader:
                 chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
                 c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
                 reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
                 r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
+                chosen_lengths = torch.tensor(chosen_lengths).view(-1, ).to(torch.cuda.current_device())
+                rejected_lengths = torch.tensor(rejected_lengths).view(-1, ).to(torch.cuda.current_device())
+                mean_chosen_length = torch.mean(chosen_lengths.float())
+                mean_rejetced_length = torch.mean(rejected_lengths.float())
                 margin = torch.tensor(margin).to(torch.cuda.current_device())
 
                 chosen_reward, reject_reward, _ = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask
                 )
+                chosen_reward = (chosen_reward / chosen_lengths) * mean_chosen_length
+                reject_reward = (reject_reward / rejected_lengths) * mean_rejetced_length
+                
                 loss = self.loss_fn(chosen_reward, reject_reward, margin)
 
                 rewards += [chosen_reward.flatten(), reject_reward.flatten()]

@@ -19,7 +19,9 @@ lib64/
 parts/
 sdist/
 var/
+scripts/
 wheels/
+nohup.out
 pip-wheel-metadata/
 share/python-wheels/
 *.egg-info/
