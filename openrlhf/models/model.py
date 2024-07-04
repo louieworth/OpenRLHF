@@ -200,6 +200,7 @@ def _get_reward_model(base_pretrained_model, base_llm_model, head_prefix="value_
             values = getattr(self, self.head_prefix)(last_hidden_states).squeeze(-1)
 
             # left padding in training mode
+            from IPython import embed; embed()
             if self.training:
                 reward = values[:, -1]
             else:

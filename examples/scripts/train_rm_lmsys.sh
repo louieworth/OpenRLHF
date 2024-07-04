@@ -1,5 +1,5 @@
 set -x 
-AVAILABLE_GPUS="4,5,6,7"
+AVAILABLE_GPUS="1"
 MODEL_PATH="sfairXC/FsfairX-LLaMA3-RM-v0.1"
 OUPUT_PATH="/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX"
 DATASET_PATH="/data02/wenhao/jl/datasets/lmsys_train.csv"

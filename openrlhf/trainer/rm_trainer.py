@@ -217,8 +217,8 @@ class RewardModelTrainer(ABC):
                 chosen_reward, reject_reward, _ = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask
                 )
-                chosen_reward = (chosen_reward / chosen_lengths) * mean_chosen_length
-                reject_reward = (reject_reward / rejected_lengths) * mean_rejetced_length
+                chosen_reward = chosen_reward 
+                reject_reward = reject_reward 
                 
                 loss = self.loss_fn(chosen_reward, reject_reward, margin)
 
