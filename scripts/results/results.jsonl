@@ -1,0 +1,25 @@
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch0", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "acc": 0.44179571950582913}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch1", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "acc": 0.4668522707499565}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch3", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "acc": 0.706107534365756}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "acc": 0.7861492952844963}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch2", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "acc": 0.5606403340873499}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "acc": 0.7861492952844963}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.09, "acc": 0.7852792761440752}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.05, "acc": 0.7678788933356534}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.07, "acc": 0.7800591613015486}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.03, "acc": 0.737254219592831}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.08, "acc": 0.7817991995823909}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.09, "acc": 0.7938479739721975}
+
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 574, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 5747, "max_memoery": 0, "acc": 0.0}
+{"model": "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4", "data": "/data02/wenhao/jl/datasets/lmsys_all.csv", "margin": 0.1, "length": 57477, "acc": 0.0}
