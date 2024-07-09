@@ -4,18 +4,22 @@ import os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import datasets
 import json
-import torch.nn.functional as F
+import ast
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoConfig, AutoModel, BitsAndBytesConfig
 from transformers.deepspeed import HfDeepSpeedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from torch.cuda.amp import autocast
 from transformers import AutoTokenizer
-from datasets import load_dataset, Dataset
+# from datasets import load_dataset, Dataset
+from torch.utils.data import Dataset
 import logging
 
 logging.basicConfig(
@@ -24,28 +28,69 @@ logging.basicConfig(
     datefmt='%m/%d/%Y %H:%M:%S'
 )
 
+def process_multi_turn_dialogue(
+    conversations, input_template="Human: {}\nAssistant: ", content_key="content", role_key="role"
+):
+    result = []
+    if type(conversations) == str and '\n' in conversations:
+        conversations = conversations.replace('\n', ',')
+        conversations = conversations.replace("} {", "}, {")
+        conversations = ast.literal_eval(conversations)
+    for l in conversations:
+        if "user" in l[role_key] or "human" in l[role_key]:
+            result.append(input_template.format(l[content_key]))
+        else:
+            result.append(l[content_key] + "\n")
+    return "".join(result)
+
+def exist_and_not_none(d, key):
+    return key in d and d[key] is not None
+
+
 class script_args:
-    base_dir = "/data02/wenhao/jl/ckpt/rm"
-    pre_train = "rm-lmsys-FsfairX_epoch4"
-    test_file = "/data02/wenhao/jl/datasets/lmsys_all.csv"
+    pretrain = "/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX_epoch4"
+    test_file = '/data02/wenhao/jl/datasets/lmsys_chatbot_arena_conversations.csv'
     save_path = "scripts/results"
-    batch_size = 1
-    max_length = 1024
-    max_total_length = 1024
-    margin = 0.1
+    batch_size = 2
+    max_length = 400
+    test_sample = 1000
+    init_value_head = False
     flash_attn = False
     bf16 = True
+    load_in_4bit = False
     disable_fast_tokenizer = False
     device = "cuda:0"
 
+def init_logger(name: str):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    # Add the handler to the logger
+    logger.addHandler(handler)
+    logger.propagate = False
+    
+    return logger
+
+# Initialize logger
+logger = init_logger(__name__)
 
 def get_llm_for_sequence_regression(
     model_name_or_path: str,
     model_type: str,
     *,
     bf16=True,
+    load_in_4bit=True,
+    lora_rank=0,
+    lora_alpha=16,
+    target_modules=None,
+    lora_dropout=0,
     normalize_reward=False,
-    use_flash_attention_2=False,
+    use_flash_attention_2=True,
+    ds_config: dict = None,
     head_prefix="value_head",
     device_map=None,
     **kwargs,
@@ -76,18 +121,27 @@ def get_llm_for_sequence_regression(
     base_pretrained_class = base_class.__base__
     cls_class = _get_reward_model(base_pretrained_class, base_class, head_prefix)
 
+    if load_in_4bit:
+        assert bf16, "we only support bnb_4bit_compute_dtype = bf16"
+        nf4_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+    else:
+        nf4_config = None
+
+
     model = cls_class.from_pretrained(
         model_name_or_path,
         config=config,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if bf16 else "auto",
-        quantization_config=None,
+        quantization_config=nf4_config,
         device_map=device_map,
         **kwargs,
     )
-
-    model.value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
-
     return model
 
 
@@ -144,8 +198,11 @@ def _get_reward_model(base_pretrained_model, base_llm_model, head_prefix="value_
 
     return RewardModel
 
-def zero_pad_sequences(sequences, max_len, side: str = "left",  value=0):
+####################################################################################################
+def zero_pad_sequences(sequences, max_len=None, side: str = "left", value=0):
     assert side in ("left", "right")
+    if max_len is None:
+        max_len = max(seq.size(-1) for seq in sequences)
     padded_sequences = []
     for seq in sequences:
         pad_len = max_len - seq.size(-1)
@@ -153,6 +210,127 @@ def zero_pad_sequences(sequences, max_len, side: str = "left",  value=0):
         padded_sequences.append(F.pad(seq, padding, value=value))
     return torch.stack(padded_sequences, dim=0)
 
+class RewardDataset(Dataset):
+    def __init__(self, dataset, tokenizer, max_length, template="Human: {}\nAssistant: {}"):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.template = template
+        
+        self.resp_as = []
+        self.resp_bs = []
+        self.prompts = []
+        self.result_ids = []
+        self.winners = []
+        for data in tqdm(dataset):
+            prompt = data["prompt"] if exist_and_not_none(data, "prompt") else ""
+            self.prompts.append(prompt)
+            self.resp_as.append(data['response_a'])
+            self.resp_bs.append(data['response_b'])
+            self.result_ids.append(data['id'])
+            if data['winner_model_a'] == 1:
+                self.winners.append(0)
+            elif data['winner_model_b'] == 1:
+                self.winners.append(1)
+            else:
+                self.winners.append(2)
+    def __len__(self):
+        return len(self.result_ids)
+
+    def __getitem__(self, idx):
+        result_id = self.result_ids[idx]
+        prompt = self.prompts[idx]
+        resp_a = self.resp_as[idx]
+        resp_b = self.resp_bs[idx]
+        winner = self.winners[idx]
+
+        # Encode prompt, resp_a, and resp_b separately with max_length / 2
+        prompt_encoded = self.tokenizer(
+            prompt,
+            max_length=self.max_length // 2,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        resp_a_encoded = self.tokenizer(
+            resp_a,
+            max_length=self.max_length // 2,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        resp_b_encoded = self.tokenizer(
+            resp_b,
+            max_length=self.max_length // 2,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Decode the encoded inputs
+        prompt_decoded = self.tokenizer.decode(prompt_encoded['input_ids'][0], skip_special_tokens=True)
+        resp_a_decoded = self.tokenizer.decode(resp_a_encoded['input_ids'][0], skip_special_tokens=True)
+        resp_b_decoded = self.tokenizer.decode(resp_b_encoded['input_ids'][0], skip_special_tokens=True)
+        
+        resp_a = self.template.format(prompt_decoded, resp_a_decoded)
+        resp_b = self.template.format(prompt_decoded, resp_b_decoded)
+        if not resp_a.endswith(self.tokenizer.eos_token):
+            resp_a += " " + self.tokenizer.eos_token
+        if not resp_b.endswith(self.tokenizer.eos_token):
+            resp_b += " " + self.tokenizer.eos_token
+        
+        resp_a_input = self.tokenizer(
+            resp_a,
+            max_length=self.max_length,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        
+        resp_b_input = self.tokenizer(
+            resp_b,
+            max_length=self.max_length,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        
+        resp_a_input["input_ids"][0][-1] = self.tokenizer.eos_token_id
+        resp_b_input["input_ids"][0][-1] = self.tokenizer.eos_token_id
+        resp_a_input["attention_mask"][0][-1] = True
+        resp_b_input["attention_mask"][0][-1] = True
+
+        return (
+            resp_a_input['input_ids'],  
+            resp_a_input['attention_mask'],
+            resp_b_input['input_ids'],
+            resp_b_input['attention_mask'],
+            result_id,
+            winner
+        )
+    def collate_fn(self, item_list):
+        resp_a_ids = []
+        resp_a_masks = []
+        resp_b_ids = []
+        resp_b_masks = []
+        result_ids = []
+        winners = []
+
+        for resp_a_id, resp_a_mask, resp_b_id, resp_b_mask, result_id, winner in item_list:
+            assert resp_a_id.shape == resp_a_mask.shape
+            assert resp_b_id.shape == resp_b_mask.shape
+            resp_a_ids.append(resp_a_id)
+            resp_a_masks.append(resp_a_mask)
+            resp_b_ids.append(resp_b_id)
+            resp_b_masks.append(resp_b_mask)
+            result_ids.append(result_id)
+            winners.append(winner)
+
+        resp_a_ids = zero_pad_sequences(resp_a_ids, value=self.tokenizer.pad_token_id)
+        resp_a_masks = zero_pad_sequences(resp_a_masks)
+        resp_b_ids = zero_pad_sequences(resp_b_ids, value=self.tokenizer.pad_token_id)
+        resp_b_masks = zero_pad_sequences(resp_b_masks)
+        
+        return resp_a_ids, resp_a_masks, resp_b_ids, resp_b_masks, result_ids, winners
 
 def get_tokenizer(pretrain, model, padding_side="left", use_fast=True):
     tokenizer = AutoTokenizer.from_pretrained(pretrain, trust_remote_code=True, use_fast=use_fast)
@@ -166,124 +344,104 @@ def get_tokenizer(pretrain, model, padding_side="left", use_fast=True):
 
     return tokenizer
 
+
+
 args = script_args()
+
 device = torch.device(args.device)
-pretrain_path = os.path.join(args.base_dir, args.pre_train)
-logging.info(f"pretrain_path: {pretrain_path}")
 model = get_llm_for_sequence_regression(
-        pretrain_path,
+        args.pretrain,
         "reward",
         normalize_reward=True,
         use_flash_attention_2=args.flash_attn,
         bf16=args.bf16,
-        init_value_head=True,
+        load_in_4bit=args.load_in_4bit,
+        device_map=args.device
     )
 
-tokenizer = get_tokenizer(pretrain_path, model, "left", use_fast=not args.disable_fast_tokenizer)
-model.to(args.device)
+tokenizer = get_tokenizer(args.pretrain, model, "left", use_fast=not args.disable_fast_tokenizer)
 model.eval()
+compiled_model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 template = "Human: {}\nAssistant: {}"
 
 
 ####################################################################################################
-results = []
-max_memory_observed = 0
+logger.info("begin-inference for GPUP100x1")
+
+# df['prompt'] = df['prompt'].astype(str)
+# df['response_a'] = df['response_a'].astype(str)
+# df['response_b'] = df['response_b'].astype(str)
+# df['total_length'] = df['prompt'].str.len() + df['response_a'].str.len() + df['response_b'].str.len()
+##################################
 df = pd.read_csv(args.test_file)
-df['prompt'] = df['prompt'].replace('null', "'null'")
-df['response_a'] = df['response_a'].replace('null', "'null'")
-df['response_b'] = df['response_b'].replace('null', "'null'")
-eval_dataset = Dataset.from_pandas(df)
-length =  len(eval_dataset)
-eval_length = int(length*0.1)
-acc = 0
-tie = 0
-for i in tqdm(range(length-eval_length, length)):
-    data = eval_dataset[i]
-    idx = data["id"]
-    resp_a = template.format(data['prompt'], data['response_a'])
-    resp_b = template.format(data['prompt'], data['response_b'])
+for index, row in df.iterrows():
+    response_a = process_multi_turn_dialogue(row["response_a"])
+    response_b = process_multi_turn_dialogue(row["response_b"])
+    df.at[index, 'response_a'] = response_a
+    df.at[index, 'response_b'] = response_b
 
-    if not resp_a.endswith(tokenizer.eos_token):
-            resp_a += " " + tokenizer.eos_token
-    if not resp_b.endswith(tokenizer.eos_token):
-            resp_b += " " + tokenizer.eos_token
+eval_dataset = datasets.Dataset.from_pandas(df)
+eval_length = len(eval_dataset)
+eval_dataset = eval_dataset.select(range(eval_length - args.test_sample, eval_length))
+##################################
+# TODO, change for real submission
+# df_sampled = df.sample(n=1000, random_state=42)
+# df_sorted = df.sort_values(by='total_length', ascending=True)
+# eval_dataset = datasets.Dataset.from_pandas(df_sorted)
+#####
 
-    resp_a_tokens = tokenizer(
-        resp_a,
-        max_length=args.max_total_length,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-    )
+# eval_dataset = eval_dataset.select(range(args.test_sample))
+
+##################################
+
+dataset = RewardDataset(eval_dataset, tokenizer, max_length=args.max_length)
+data_loader = DataLoader(
+    dataset,
+    batch_size=args.batch_size,
+    drop_last=False,
+    collate_fn=dataset.collate_fn,
+    pin_memory=False
+)
+
+####################################################################################################
+####################################################################################################
+results = []
+logger.info("begin inference")
+# import torch_tensorrt
+for resp_a_ids, resp_a_masks, resp_b_ids, resp_b_masks, ids, winners in tqdm(data_loader):
+    resp_a_ids = resp_a_ids.squeeze(1).to(device).long()
+    resp_a_masks = resp_a_masks.squeeze(1).to(device).long()
+    resp_b_ids = resp_b_ids.squeeze(1).to(device).long()
+    resp_b_masks = resp_b_masks.squeeze(1).to(device).long()
+    batch_size = resp_a_ids.size(0)
+    max_batch_size = max(resp_a_ids.size(-1), resp_b_ids.size(-1))
     
-    resp_b_tokens = tokenizer(
-        resp_b,
-        max_length=args.max_total_length,
-        padding=True,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    resp_a_ids = resp_a_tokens['input_ids']
-    resp_a_mask = resp_a_tokens['attention_mask']
-    resp_b_ids = resp_b_tokens['input_ids']
-    resp_b_mask = resp_b_tokens['attention_mask']
-
-    resp_a_ids[0][-1] = tokenizer.eos_token_id
-    resp_b_ids[0][-1] = tokenizer.eos_token_id
-    resp_a_mask[0][-1] = True
-    resp_b_mask[0][-1] = True
-
-    max_len = max(resp_a_ids.size(-1), resp_b_ids.size(-1))
-    resp_a_ids = zero_pad_sequences(resp_a_ids, max_len=max_len, value=tokenizer.pad_token_id)
-    resp_b_ids = zero_pad_sequences(resp_b_ids, max_len=max_len, value=tokenizer.pad_token_id)
-    resp_a_mask = zero_pad_sequences(resp_a_mask, max_len=max_len)
-    resp_b_mask = zero_pad_sequences(resp_b_mask, max_len=max_len)
-
-    resp_ids = torch.cat([resp_a_ids, resp_b_ids], dim=0)
-    resp_mask = torch.cat([resp_a_mask, resp_b_mask], dim=0)
+    resp_a_ids = zero_pad_sequences(resp_a_ids, max_len=max_batch_size, value=tokenizer.pad_token_id)
+    resp_a_masks = zero_pad_sequences(resp_a_masks, max_len=max_batch_size)
+    resp_b_ids = zero_pad_sequences(resp_b_ids, max_len=max_batch_size, value=tokenizer.pad_token_id)
+    resp_b_masks = zero_pad_sequences(resp_b_masks, max_len=max_batch_size)
     
-    with torch.no_grad():
-        with autocast():
-            torch.cuda.empty_cache()
-            resp_ids = resp_ids.to(device)
-            resp_mask = resp_mask.to(device)
-            # rewards = model(resp_ids, resp_mask).cpu().numpy()
-            # resp_a_reward, resp_b_reward = rewards[0], rewards[1]
-            resp_a_reward = model(resp_a_ids.to(device), resp_a_mask.to(device)).cpu().item()
-            resp_b_reward = model(resp_b_ids.to(device), resp_b_mask.to(device)).cpu().item()
-            resp_a_reward = round(resp_a_reward, 3)
-            resp_b_reward = round(resp_b_reward, 3)
-            # del resp_ids, resp_mask
-            logging.info(f"resp_a_reward: {resp_a_reward}, resp_b_reward: {resp_b_reward}")
-
-    result = {
-        "id": idx, 
-        "resp_a_reward": resp_a_reward,
-        "resp_b_reward": resp_b_reward,
-        "winner_model_a": data['winner_model_a'],
-        "winner_model_b": data['winner_model_b'],
-        "winner_tie": data['winner_tie']
-    }
-    results.append(result)
-record = {
-    "model": pretrain_path,
-    "data": args.test_file,
-    "margin": args.margin,
-    "length": eval_length,
-    "max_memoery": max_memory_observed,
-    "acc": acc/eval_length,
-}
-jsonl_file_path = f"{args.save_path}/results.jsonl"
-
-
-if not os.path.exists(jsonl_file_path):
-    with open(jsonl_file_path, 'w') as jsonl_file:
-        pass  
-
-with open(jsonl_file_path, 'a') as jsonl_file: 
-    jsonl_file.write(json.dumps(record) + '\n')
+    resp_ids = torch.cat((resp_a_ids, resp_b_ids), dim=0).long()
+    resp_masks = torch.cat((resp_a_masks, resp_b_masks), dim=0).long()
+    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+        with torch.no_grad():
+            rewards = model(resp_ids, resp_masks).cpu()
+        
+    resp_a_rewards = rewards[:batch_size]
+    resp_b_rewards = rewards[batch_size:]
+    for i in range(batch_size): 
+        results.append({
+            "id": ids[i],
+            "resp_a_reward": round(resp_a_rewards[i].item(), 2),
+            "resp_b_reward": round(resp_b_rewards[i].item(), 2),
+            "winner": winners[i]
+        })
+df = pd.DataFrame(results)
+logger.info(f"maxlen: {args.max_length}")
+logger.info(f'end training, sample: {args.test_sample}')
+save_csv_path = f"{args.save_path}/chat_arean_reward_sample_{args.test_sample}.csv"
 
 df = pd.DataFrame(results)
-df.to_csv(f"{args.save_path}/reward_{args.pre_train}_eval.csv", index=False)
-print(f"Results saved to {jsonl_file_path}")
+df.to_csv(save_csv_path, index=False)
+logger.info(f"Results saved to {save_csv_path}")
+# print(f"Results saved to {jsonl_file_path}")

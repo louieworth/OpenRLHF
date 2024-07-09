@@ -1,1 +1,1 @@
-{"dropout_rate": 0.1, "temperature": 1.0, "learning_rate": 1e-06, "epoch": 707, "train_loss": 1.0879, "eval_loss": 1.0872, "hardcoded_loss": 1.2082, "model_path": "None"}
+{"dropout_rate": 0.0, "temperature": 1.0, "learning_rate": 0.0001, "epoch": 199, "train_loss": 0.4357, "eval_loss": 0.428, "hardcoded_loss": 0.7559, "model_path": "/home/wenhao/jiangli/OpenRLHF/rm-to-win/ckpt/0706_1252_reward_total.csv_epoch_199.pth"}

@@ -2,7 +2,7 @@ set -x
 AVAILABLE_GPUS="1"
 MODEL_PATH="sfairXC/FsfairX-LLaMA3-RM-v0.1"
 OUPUT_PATH="/data02/wenhao/jl/ckpt/rm/rm-lmsys-FsfairX"
-DATASET_PATH="/data02/wenhao/jl/datasets/lmsys_train.csv"
+DATASET_PATH="/data02/wenhao/jl/datasets/lmsys_all.csv"
 TEST_DATASET_PATH="/data02/wenhao/jl/datasets/lmsys_test.csv"
 
 read -r -d '' training_commands <<EOF
