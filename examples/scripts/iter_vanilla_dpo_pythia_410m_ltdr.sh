@@ -26,7 +26,7 @@ checkSuccess() {
 
 export PATH=$HOME/.local/bin/:$PATH
 
-iter=1
+iter=
 if [ -f $ITER_LOG_PATH ]; then
     iter=$(cat $ITER_LOG_PATH)
 fi
@@ -35,7 +35,7 @@ while (($iter < $TRAINING_ITERS)); do
     echo "Iter: $iter"
     # Create unique output paths for each iteration
     GENERATE_OUTPUT="${base_dir}/iter_${iter}_generate.jsonl"
-    RM_OUTPUT="${base_dir}/iter_0_rm.jsonl"
+    RM_OUTPUT="${base_dir}/iter_${iter}_rm.jsonl"
     MODEL_OUTPUT_PATH="${base_dir}/iter_${iter}_ckpt"
 
     # Use latest model if past first iteration

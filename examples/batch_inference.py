@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 
 from openrlhf.datasets import PromptDataset, SFTDataset
 from openrlhf.models import Actor, get_llm_for_sequence_regression
-from openrlhf.utils import blending_datasets, get_processor, get_strategy, get_tokenizer
+from openrlhf.utils import blending_datasets, get_processor, get_strategy, get_tokenizer, get_batch_logps
 
 
 def batch_generate_vllm(args):
@@ -50,24 +50,24 @@ def batch_generate_vllm(args):
     )
 
     
-    train_dataset, eval_data = blending_datasets(
+    prompts_data = blending_datasets(
         args.dataset,
         args.dataset_probs,
         dummy_strategy,
         args.seed,
-        return_eval=True,
+        return_eval=False,
         max_count=args.max_samples,
     )
-
-    if not args.eval:
-        prompts_data = train_dataset
-    else:
-        prompts_data = eval_data
-        
-    length = min(len(prompts_data), args.rollout_batch_size)
-    random_indices = random.sample(range(len(prompts_data)), length)
-    prompts_data = prompts_data.select(random_indices)
-
+    # num_samples = min(args.rollout_batch_size, len(prompts_data))
+    # random_indices = random.sample(range(len(prompts_data)), num_samples)
+    prompts_data = prompts_data.select(range(min(args.rollout_batch_size, len(prompts_data))))
+    # if args.iter is None:
+    #     prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
+    # else:
+        # for iterative generation
+        # start_idx = args.iter * args.rollout_batch_size
+        # end_idx = start_idx + args.rollout_batch_size
+        # prompts_data = prompts_data.select(range(start_idx, min(end_idx, len(prompts_data))))
 
     prompts_dataset = PromptDataset(prompts_data, tokenizer, dummy_strategy, input_template=args.input_template)
     prompts = list(prompts_dataset)
@@ -195,6 +195,103 @@ def batch_generate(args):
                     output_dataset.append(obj)
             os.remove(file)
 
+        with jsonlines.open(args.output_path, mode="w") as writer:
+            writer.write_all(output_dataset)
+
+def batch_self_rm_inference(args):
+    # configure strategy
+    strategy = get_strategy(args)
+    strategy.setup_distributed(timeout=timedelta(minutes=180))
+
+    # configure model
+    model = Actor(
+        args.pretrain,
+        use_flash_attention_2=args.flash_attn,
+        bf16=args.bf16,
+    )
+
+    # configure tokenizer
+    tokenizer = get_tokenizer(args.pretrain, model.model, "left", strategy, use_fast=not args.disable_fast_tokenizer)
+
+    # prepare models
+    model = strategy.prepare(model)
+    model.eval()
+    if args.ref_pretrain:
+        ref_model = Actor(
+            args.ref_pretrain,
+            use_flash_attention_2=args.flash_attn,
+            bf16=args.bf16,
+        )
+        ref_model = strategy.prepare(ref_model)
+        ref_model.eval()
+
+    dataset = blending_datasets(
+        args.dataset,
+        args.dataset_probs,
+        strategy,
+        args.seed,
+        return_eval=False,
+        max_count=args.max_samples,
+    )
+    dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+    dataset = SFTDataset(
+        dataset, tokenizer, args.max_len, strategy, pretrain_mode=False, input_template=args.input_template
+    )
+    dataloader = strategy.setup_dataloader(
+        dataset, args.micro_batch_size, True, False, dataset.collate_fn, drop_last=False
+    )
+    pbar = tqdm(
+        dataloader,
+        disable=not strategy.is_rank_0(),
+    )
+
+    dist.barrier()
+
+    output_dataset = []
+    with torch.no_grad():
+        for prompt_id_lens, input_ids, attention_masks, info in pbar:
+            input_ids = input_ids.squeeze(1).to(torch.cuda.current_device())
+            attention_masks = attention_masks.squeeze(1).to(torch.cuda.current_device())
+            # prompt_id_lens = prompt_id_lens.to(torch.cuda.current_device())
+            output = model(input_ids, attention_mask=attention_masks, return_output=True)
+            all_logits = output["logits"]
+            # average_log_prob=True --> regularizer on length
+            all_logps = get_batch_logps(all_logits, input_ids, attention_masks, prompt_id_lens, average_log_prob=True)
+            if args.ref_pretrain:
+                ref_output = ref_model(input_ids, attention_mask=attention_masks, return_output=True)
+                ref_all_logits = ref_output["logits"]
+                ref_all_logps = get_batch_logps(ref_all_logits, input_ids, attention_masks, prompt_id_lens, average_log_prob=True)
+                all_logps = all_logps - ref_all_logps
+            
+            for prompt, output, reward in zip(info["input"], info["output"], all_logps):
+                output_dataset.append({"input": prompt, "output": output, "reward": reward.item()})
+
+            dist.barrier()
+
+    with jsonlines.open(args.output_path + str(strategy.get_rank()), mode="w") as writer:
+        writer.write_all(output_dataset)
+
+    # wait unitl all processes generate done
+    dist.barrier()
+
+    # concate multiple output files in rank 0
+    if strategy.is_rank_0():
+        output_dataset = []
+        world_size = dist.get_world_size()
+        files = [args.output_path + str(rank) for rank in range(world_size)]
+        for file in files:
+            with jsonlines.open(file, mode="r") as reader:
+                for obj in reader:
+                    output_dataset.append(obj)
+            # os.remove(file)
+
+        rewards = torch.tensor([obj["reward"] for obj in output_dataset])
+        print(f"Reward mean: {rewards.mean().item()}, std: {rewards.std().item()}")
+
+        if args.post_processor and args.post_processor != "null":
+            strategy.print(f"Use Processor {args.post_processor}, Reward Norm {args.normalize_reward}")
+            processor = get_processor(args.post_processor)
+            output_dataset = processor(args, output_dataset)
         with jsonlines.open(args.output_path, mode="w") as writer:
             writer.write_all(output_dataset)
 
@@ -356,6 +453,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--eval_task", type=str, default=None, help="set to generate, generate_vllm or rm")
     parser.add_argument("--pretrain", type=str, default=None)
+    parser.add_argument("--ref_pretrain", type=str, default=None)
     parser.add_argument("--max_len", type=int, default=2048)
     parser.add_argument("--zero_stage", type=int, default=0)
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
@@ -417,5 +515,7 @@ if __name__ == "__main__":
         batch_rm_inference(args)
     elif args.eval_task and args.eval_task == "rm_acc":
         batch_rm_acc(args)
+    elif args.eval_task and args.eval_task == "self_rm":
+        batch_self_rm_inference(args)
     else:
         print("Invalid or missing '--eval_task' argument. Please specify either 'generate' or 'rm'.")

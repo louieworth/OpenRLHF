@@ -2,21 +2,21 @@
 set -x
 
 script_name=$(basename $0 .sh)
-base_dir="/data02/wenhao/jl/ckpt/pythia_410m/tldr/Llama3-8B_RM_iter_dpo"
+base_dir="/data02/wenhao/jl/ckpt/pythia_410m/tldr/self"
 mkdir -p $base_dir
 ITER_LOG_PATH=null
-AVAILABLE_GPUS="4,5,6,7"
+AVAILABLE_GPUS="4,5"
 
-TRAINING_ITERS=4
+TRAINING_ITERS=3
 BEST_OF_N=2
 ROLLOUT_BATCH_SIZE=90000
 TEMPERATURE=1
 
 POLICY_MODEL_PATH="/data02/wenhao/jl/ckpt/pythia_410m/tldr/offline_dpo_1_epoch"
-REWARD_MODEL_PATH="/data02/wenhao/jl/ckpt/rm/rm-tldr-Meta-Llama-3-8B-Instruct"
+# REWARD_MODEL_PATH="/data02/wenhao/jl/ckpt/rm/rm-tldr-Meta-Llama-3-8B-Instruct"
 DATASET_PATH="when2rl/tldr-summarisation-preferences_reformatted"
+GENAT_REF_MODEL_PATH="EleutherAI/pythia-410m"
 REF_MODEL_PATH=$POLICY_MODEL_PATH
-
 checkSuccess() {
     if [[ $? != 0 ]]; then
         echo "FAILED $1"
@@ -26,7 +26,7 @@ checkSuccess() {
 
 export PATH=$HOME/.local/bin/:$PATH
 
-iter=1
+iter=0
 if [ -f $ITER_LOG_PATH ]; then
     iter=$(cat $ITER_LOG_PATH)
 fi
@@ -35,8 +35,7 @@ while (($iter < $TRAINING_ITERS)); do
     echo "Iter: $iter"
     # Create unique output paths for each iteration
     GENERATE_OUTPUT="${base_dir}/iter_${iter}_generate.jsonl"
-    # RM_OUTPUT="${base_dir}/iter_${iter}_rm.jsonl"
-    RM_OUTPUT="${base_dir}/iter_0_rm.jsonl"
+    RM_OUTPUT="${base_dir}/iter_${iter}_rm.jsonl"
     MODEL_OUTPUT_PATH="${base_dir}/iter_${iter}_ckpt"
 
     # Use latest model if past first iteration
@@ -44,47 +43,48 @@ while (($iter < $TRAINING_ITERS)); do
         POLICY_MODEL_PATH="${base_dir}/iter_$((iter - 1))_ckpt"
     fi
 
-    # generate_commands="examples/batch_inference.py \
-    #     --eval_task generate_vllm \
-    #     --pretrain $POLICY_MODEL_PATH \
-    #     --max_new_tokens 100 \
-    #     --dataset $DATASET_PATH \
-    #     --dataset_probs 1.0 \
-    #     --temperature $TEMPERATURE \
-    #     --tp_size 4 \
-    #     --best_of_n $BEST_OF_N \
-    #     --max_num_seqs 128 \
-    #     --iter $iter \
-    #     --rollout_batch_size $ROLLOUT_BATCH_SIZE \
-    #     --output_path $GENERATE_OUTPUT"
-    # echo $generate_commands
+    generate_commands="examples/batch_inference.py \
+        --eval_task generate_vllm \
+        --pretrain $POLICY_MODEL_PATH \
+        --max_new_tokens 100 \
+        --dataset $DATASET_PATH \
+        --dataset_probs 1.0 \
+        --temperature $TEMPERATURE \
+        --tp_size 2 \
+        --best_of_n $BEST_OF_N \
+        --max_num_seqs 128 \
+        --iter $iter \
+        --rollout_batch_size $ROLLOUT_BATCH_SIZE \
+        --output_path $GENERATE_OUTPUT"
+    echo $generate_commands
 
-    # if [ $iter -eq 0 ] && [ -f "$GENERATE_OUTPUT" ]; then
-    #     echo "Skipping generation as $GENERATE_OUTPUT already exists."
-    # else
-    #     CUDA_VISIBLE_DEVICES=$AVAILABLE_GPUS python $generate_commands
-    #     checkSuccess "GENERATE"
-    # fi
+    if [ $iter -eq 0 ] && [ -f "$GENERATE_OUTPUT" ]; then
+        echo "Skipping generation as $GENERATE_OUTPUT already exists."
+    else
+        CUDA_VISIBLE_DEVICES=$AVAILABLE_GPUS python $generate_commands
+        checkSuccess "GENERATE"
+    fi
 
-    # get_rewards_commands="examples/batch_inference.py \
-    #     --eval_task rm \
-    #     --pretrain $REWARD_MODEL_PATH \
-    #     --bf16 \
-    #     --max_len 2048 \
-    #     --dataset $GENERATE_OUTPUT \
-    #     --dataset_probs 1.0 \
-    #     --zero_stage 0 \
-    #     --post_processor iter_dpo \
-    #     --micro_batch_size 8 \
-    #     --output_path $RM_OUTPUT"
-    # echo $get_rewards_commands
+    get_rewards_commands="examples/batch_inference.py \
+        --eval_task self_rm \
+        --pretrain $POLICY_MODEL_PATH \
+        --ref_pretrain $GENAT_REF_MODEL_PATH \
+        --bf16 \
+        --max_len 2048 \
+        --dataset $GENERATE_OUTPUT \
+        --dataset_probs 1.0 \
+        --zero_stage 0 \
+        --post_processor iter_dpo \
+        --micro_batch_size 4 \
+        --output_path $RM_OUTPUT"
+    echo $get_rewards_commands
 
-    # if [ $iter -eq 0 ] && [ -f "$RM_OUTPUT" ]; then
-    #     echo "Skipping generation as $RM_OUTPUT already exists."
-    # else
-    #     deepspeed --include localhost:$AVAILABLE_GPUS $get_rewards_commands
-    #     checkSuccess "RM"
-    # fi
+    if [ $iter -eq 0 ] && [ -f "$RM_OUTPUT" ]; then
+        echo "Skipping self RM as $RM_OUTPUT already exists."
+    else
+        deepspeed --master_port=29501 --include localhost:$AVAILABLE_GPUS $get_rewards_commands
+        checkSuccess "self RM"
+    fi
 
     dpo_commands="examples/train_dpo.py \
         --max_len 2048 \
@@ -99,13 +99,14 @@ while (($iter < $TRAINING_ITERS)); do
         --save_path $MODEL_OUTPUT_PATH \
         --rollout_batch_size $ROLLOUT_BATCH_SIZE \
         --zero_stage 3 \
-        --beta 0.1 \
+        --beta 0.5 \
         --max_epochs 1 \
         --bf16 \
         --learning_rate 1e-5 \
-        --flash_attn"
+        --use_wandb 9d45bb78a65fb0f3b0402a9eae36ed832ae8cbdc \
+        --flash_attn" 
     echo $dpo_commands
-    deepspeed --include localhost:$AVAILABLE_GPUS $dpo_commands
+    deepspeed --master_port=29501 --include localhost:$AVAILABLE_GPUS $dpo_commands
     checkSuccess "DPO"
 
     iter=$((iter + 1))

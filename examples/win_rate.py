@@ -30,7 +30,7 @@ def compare_rewards(file1, file2, output_path, jsonl_output_path):
 
     avg_model1_performance = sum(entry[1] for entry in rewards_1.values()) / total_comparisons
     avg_model2_performance = sum(entry[1] for entry in rewards_2.values()) / total_comparisons
-    tie_threshold = np.abs(avg_model2_performance) * 0.1
+    tie_threshold = np.abs(avg_model2_performance) * 0.05
 
     for prompt, (response1, reward1) in rewards_1.items():
         response2, reward2 = rewards_2[prompt]

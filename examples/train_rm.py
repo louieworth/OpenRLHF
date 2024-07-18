@@ -45,14 +45,12 @@ def train(args):
     # prepare for data and dataset
     train_data, eval_data = blending_datasets(
         args.dataset,
-        args.test_dataset,
         args.dataset_probs,
         strategy,
         args.seed,
         max_count=5000000,
         stopping_strategy="all_exhausted",
     )
-    from IPython import embed; embed()
     
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
     eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
@@ -154,6 +152,7 @@ if __name__ == "__main__":
     parser.add_argument("--aux_loss_coef", type=float, default=0)
     parser.add_argument("--grad_accum_dtype", type=str, default=None)
     parser.add_argument("--disable_trace_cache", action="store_true", default=False)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
     parser.add_argument("--lora_rank", type=int, default=0)
     parser.add_argument("--lora_alpha", type=int, default=16)

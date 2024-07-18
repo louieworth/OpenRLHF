@@ -6,22 +6,23 @@ script_name=$(basename $0 .sh)
 
 mkdir -p $eval_dir
 ITER_LOG_PATH=null
-AVAILABLE_GPUS="4,5,6,7"
+AVAILABLE_GPUS="0,1"
 
 # TRAINING_ITERS=2
 BEST_OF_N=1
-ROLLOUT_BATCH_SIZE=50000
+ROLLOUT_BATCH_SIZE=2000
 TEMPERATURE=1
 
 base_dir="/data02/wenhao/jl/ckpt/pythia_410m/tldr"
-eval_dir="${base_dir}/Llama3-8B_RM_eval"
+eval_dir="${base_dir}/self_eval"
 mkdir -p $eval_dir
 
-POLICY_1_MODEL_PATH="Llama3-8B_RM_iter_dpo/iter_0_ckpt"
+POLICY_1_MODEL_PATH="offline_dpo_1_epoch"
+POLICY_2_MODEL_PATH="self/iter_2_ckpt"
 # "Llama3-8B_RM_vanilla_iter_dpo/iter_0_ckpt"
 # pythia_410m/tldr/offline_dpo_1_epoch
 # POLICY_1_MODEL_PATH="EleutherAI/pythia-410m"
-POLICY_2_MODEL_PATH="Llama3-8B_RM_vanilla_iter_dpo/iter_0_ckpt"
+
 REWARD_MODEL_PATH="/data02/wenhao/jl/ckpt/rm/rm-tldr-Meta-Llama-3-8B-Instruct"
 DATASET_PATH="when2rl/tldr-summarisation-preferences_reformatted"
 
@@ -54,7 +55,7 @@ generate_commands="examples/batch_inference.py \
     --dataset $DATASET_PATH \
     --dataset_probs 1.0 \
     --temperature $TEMPERATURE \
-    --tp_size 4 \
+    --tp_size 2 \
     --best_of_n $BEST_OF_N \
     --max_num_seqs 128 \
     --eval \
@@ -71,7 +72,7 @@ generate_commands="examples/batch_inference.py \
     --dataset $DATASET_PATH \
     --dataset_probs 1.0 \
     --temperature $TEMPERATURE \
-    --tp_size 4 \
+    --tp_size 2 \
     --best_of_n $BEST_OF_N \
     --max_num_seqs 128 \
     --eval \
@@ -94,7 +95,7 @@ get_rewards_commands="examples/batch_inference.py \
     --eval \
     --output_path $POLICY_1_RM_OUTPUT"
 echo $get_rewards_commands
-deepspeed --include localhost:$AVAILABLE_GPUS $get_rewards_commands
+deepspeed --master_port=29501 --include localhost:$AVAILABLE_GPUS $get_rewards_commands
 checkSuccess "RM"
 
 
@@ -111,7 +112,7 @@ get_rewards_commands="examples/batch_inference.py \
     --eval \
     --output_path $POLICY_2_RM_OUTPUT"
 echo $get_rewards_commands
-deepspeed --include localhost:$AVAILABLE_GPUS $get_rewards_commands
+deepspeed --master_port=29501 --include localhost:$AVAILABLE_GPUS $get_rewards_commands
 checkSuccess "RM"
 
 win_rate_commands="examples/win_rate.py \

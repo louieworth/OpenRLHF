@@ -5,6 +5,7 @@ from datasets import Dataset, interleave_datasets, load_dataset
 from transformers import AutoTokenizer
 
 from openrlhf.utils import DeepspeedStrategy
+import torch
 
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
@@ -40,13 +41,14 @@ def get_strategy(args):
 
 def blending_datasets(
     datasets,
-    test_dataset,
     probabilities,
     strategy=None,
     seed=42,
     max_count=5000000,
     return_eval=True,
     stopping_strategy="first_exhausted",
+    train_split="train",
+    eval_split=None,
 ):
     datasets = datasets.split(",")
     probabilities = list(map(float, probabilities.split(",")))
@@ -57,8 +59,9 @@ def blending_datasets(
     for i, dataset in enumerate(datasets):
         dataset = dataset.strip()
         dataset_subfold_list = dataset.split("@")
-        strategy.print(f"dataset: {dataset}")
+        strategy.print(f"dataet: {dataset}")
         # local dir with python script or common local file
+        
         if os.path.isdir(os.path.join(os.getcwd(), dataset)) or dataset.endswith(
             (".json", ".jsonl", ".csv", ".parquet", ".txt")
         ):
@@ -96,32 +99,18 @@ def blending_datasets(
             data = load_dataset(dataset)
         else:
             raise Exception(f"Dataset Name {dataset}: Format error")
-        
-        if "train" in data:
-            train_data_list.append(data["train"].select(range(min(max_count, len(data["train"])))))
-        elif "train_prefs" in data:  # for HuggingFaceH4/ultrafeedback_binarized
-            train_data_list.append(data["train_prefs"].select(range(min(max_count, len(data["train_prefs"])))))
+        if train_split and train_split in data:
+            train_data = data[train_split].select(range(min(max_count, len(data[train_split]))))
         else:
-            train_data_list.append(data.select(range(min(max_count, len(data)))))  # train will contains eval? TODO
+            train_data = data.select(range(min(max_count, len(data))))
+        train_data_list.append(train_data)
 
         if return_eval:
-            max_count01 = int(max_count * 0.1)
-            max_count01 = min(int(len(data['train']) * 0.1), 5000)
-            if test_dataset is not None:
-                data_type = os.path.splitext(test_dataset)[1][1:]
-                eval_data = load_dataset(data_type, data_files=test_dataset)
-                if 'train' in eval_data:
-                    eval_data = eval_data['train']
-            elif "test" in data:
-                eval_data = data["test"].select(range(min(max_count01, len(data["test"]))))
-            elif "validation" in data:
-                eval_data = data["validation"].select(range(min(max_count01, len(data["validation"]))))
-            elif "test_prefs" in data:  
-                eval_data = data["test_prefs"].select(range(min(max_count01, len(data["test_prefs"]))))
-            elif "train" in data:
-                eval_data = data["train"].select(range(min(max_count01, int(len(data["train"]) * 0.01))))
+            if eval_split and eval_split in data:
+                eval_data = data[eval_split].select(range(min(max_count, len(data[eval_split]))))
+            # train will contains eval? TODO
             else:
-                eval_data = data.select(range(min(int(max_count01), int(len(data) * 0.01))))
+                eval_data = train_data.select(range(min(max_count, int(len(train_data) * 0.03))))
             eval_data_list.append(eval_data)
 
     # merge datasets
@@ -144,3 +133,40 @@ def blending_datasets(
         return train_dataset, eval_dataset
     else:
         return train_dataset
+
+def get_batch_logps(
+        logits: torch.FloatTensor,
+        labels: torch.LongTensor,
+        attention_mask,
+        prompt_id_lens,
+        average_log_prob: bool = False,
+    ) -> torch.FloatTensor:
+        """Compute the log probabilities of the given labels under the given logits.
+
+        Args:
+            logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
+            labels: Labels for which to compute the log probabilities. Label tokens with a value of -100 are ignored. Shape: (batch_size, sequence_length)
+            average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
+
+        Returns:
+            A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
+        """
+        assert logits.shape[:-1] == labels.shape
+
+        labels = labels[:, 1:].clone()
+        logits = logits[:, :-1, :]
+
+        loss_masks = attention_mask.clone().bool()
+        # mask prompts
+        for mask, source_len in zip(loss_masks, prompt_id_lens):
+            mask[:source_len] = False
+        loss_masks = loss_masks[:, 1:]
+
+        # dummy token; we'll ignore the losses on these tokens later
+        labels[loss_masks == False] = 0
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+
+        if average_log_prob:
+            return (per_token_logps * loss_masks).sum(-1) / loss_masks.sum(-1)
+        else:
+            return (per_token_logps * loss_masks).sum(-1)
