@@ -1,30 +1,30 @@
-import math
+import os
 from abc import ABC
 
 import torch
-from torch import nn
 from torch.optim import Optimizer
-from torch.utils.data import DistributedSampler
 from tqdm import tqdm
-from transformers.trainer import get_scheduler
 
-from openrlhf.datasets import SFTDataset
 from openrlhf.models import GPTLMLoss, KDLoss
+from openrlhf.utils.distributed_sampler import DistributedSampler
 
 
 class KDTrainer(ABC):
     """
-        Trainer to use while training reward model.
+    Trainer for Knowledge Distillation.
 
     Args:
-        model (torch.nn.Module): the model to train
-        strategy (Strategy): the strategy to use for training
-        optim(Optimizer): the optimizer to use for training
-        train_dataset (RewardDataset): the dataset to use for training
-        eval_dataset (RewardDataset): the dataset to use for evaluation
-        batch_size (int, defaults to 1): the batch size while training
-        max_epochs (int, defaults to 2): the number of epochs to train
-        optim_kwargs (dict, defaults to {'lr':1e-4}): the kwargs to use while initializing optimizer
+        model (torch.nn.Module): The model to be trained.
+        strategy (Strategy): The training strategy to be applied.
+        optim (Optimizer): The optimizer for model training.
+        train_dataloader (DataLoader): The dataloader for the training dataset.
+        eval_dataloader (DataLoader): The dataloader for the evaluation dataset.
+        scheduler (Scheduler): The learning rate scheduler to adjust training rates.
+        max_norm (float, defaults to 1): Maximum gradient norm for clipping to prevent exploding gradients.
+        pretrain_mode (bool, defaults to False): Flag to indicate if the trainer is in pre-training mode.
+        batch_size (int, defaults to 1): Batch size for training.
+        max_epochs (int, defaults to 2): The maximum number of training epochs.
+        tokenizer (Tokenizer, optional): The tokenizer for processing input data.
     """
 
     def __init__(
@@ -41,6 +41,8 @@ class KDTrainer(ABC):
         batch_size: int = 1,
         max_epochs: int = 2,
         tokenizer=None,
+        save_hf_ckpt: bool = False,
+        disable_ds_ckpt: bool = False,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -56,12 +58,15 @@ class KDTrainer(ABC):
         self.tokenizer = tokenizer
         self.optimizer = optim
         self.args = strategy.args
+        self.disable_ds_ckpt = disable_ds_ckpt
+        self.save_hf_ckpt = save_hf_ckpt
 
         self.loss_fn = GPTLMLoss()
         self.kd_loss = KDLoss()
 
-        # wandb setting
+        # wandb/tensorboard setting
         self._wandb = None
+        self._tensorboard = None
         if self.strategy.args.use_wandb and self.strategy.is_rank_0():
             import wandb
 
@@ -82,22 +87,37 @@ class KDTrainer(ABC):
             wandb.define_metric("eval/global_step")
             wandb.define_metric("eval/*", step_metric="eval/global_step", step_sync=True)
 
-    def fit(self, args):
+        # Initialize TensorBoard writer if wandb is not available
+        if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
+            from torch.utils.tensorboard import SummaryWriter
+
+            os.makedirs(self.strategy.args.use_tensorboard, exist_ok=True)
+            log_dir = os.path.join(self.strategy.args.use_tensorboard, strategy.args.wandb_run_name)
+            self._tensorboard = SummaryWriter(log_dir=log_dir)
+
+    def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # get eval and save steps
         if args.eval_steps == -1:
-            args.eval_steps = self.train_dataloader.__len__()  # Evaluate once per epoch
+            args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
         if args.save_steps == -1:
             args.save_steps = float("inf")  # do not save ckpt
 
-        global_step = 1
+        # Restore step and start_epoch
+        step = consumed_samples // args.train_batch_size * self.strategy.accumulated_gradient + 1
+        start_epoch = consumed_samples // args.train_batch_size // num_update_steps_per_epoch
+        consumed_samples = consumed_samples % (num_update_steps_per_epoch * args.train_batch_size)
+
         epoch_bar = tqdm(
-            range(self.epochs),
+            range(start_epoch, self.epochs),
             desc="Train epoch",
             disable=not self.strategy.is_rank_0(),
         )
-        for epoch in range(self.epochs):
+        loss_sum = 0
+        for epoch in range(start_epoch, self.epochs):
             if isinstance(self.train_dataloader.sampler, DistributedSampler):
-                self.train_dataloader.sampler.set_epoch(epoch)
+                self.train_dataloader.sampler.set_epoch(
+                    epoch, consumed_samples=0 if epoch > start_epoch else consumed_samples
+                )
 
             step_bar = tqdm(
                 range(self.train_dataloader.__len__()),
@@ -108,11 +128,11 @@ class KDTrainer(ABC):
             # train
             self.model.train()
             self.teacher_model.eval()
-            loss_mean = 0
-            for prompts_id_len, inputs, attention_masks, _ in self.train_dataloader:
+            for inputs, attention_masks, loss_masks in self.train_dataloader:
                 inputs = inputs.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_masks.squeeze(1).to(torch.cuda.current_device())
                 output = self.model(inputs, attention_mask=attention_mask, return_output=True)
+                prompts_id_len = (loss_masks != 0).int().argmax(dim=-1).squeeze(-1)
 
                 # loss function
                 labels = torch.where(
@@ -137,41 +157,63 @@ class KDTrainer(ABC):
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
-                loss_mean = loss_mean * 0.9 + 0.1 * gpt_loss.item()
-                logs_dict = {"gpt_loss": gpt_loss.item(), "distil_loss": distil_loss.item(), "loss_mean": loss_mean}
+                loss_sum += gpt_loss.item()
+                logs_dict = {
+                    "gpt_loss": gpt_loss.item(),
+                    "distil_loss": distil_loss.item(),
+                    "lr": self.scheduler.get_last_lr()[0],
+                }
+                # step bar
+                logs_dict = self.strategy.all_reduce(logs_dict)
+                step_bar.set_postfix(logs_dict)
+                step_bar.update()
 
                 # logs/checkpoints/evaluation
-                self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict)
+                if step % self.strategy.accumulated_gradient == 0:
+                    logs_dict["loss_mean"] = loss_sum / self.strategy.accumulated_gradient
+                    loss_sum = 0
+                    global_step = step // self.strategy.accumulated_gradient
+                    client_states = {"consumed_samples": global_step * args.train_batch_size}
+                    self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
 
-                step_bar.update()
-                global_step += 1
+                step += 1
 
             epoch_bar.update()
 
-    # logs/checkpoints/evaluation
-    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}):
-        if global_step % args.logging_steps == 0:
-            # step bar
-            logs_dict = self.strategy.all_reduce(logs_dict)
-            step_bar.set_postfix(logs_dict)
+        if self._wandb is not None and self.strategy.is_rank_0():
+            self._wandb.finish()
+        if self._tensorboard is not None and self.strategy.is_rank_0():
+            self._tensorboard.close()
 
+    # logs/checkpoints/evaluation
+    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
+        if global_step % args.logging_steps == 0:
             # wandb
-            if (
-                self._wandb is not None
-                and self.strategy.is_rank_0()
-                and global_step % self.strategy.accumulated_gradient == 0
-            ):
+            if self._wandb is not None and self.strategy.is_rank_0():
                 logs = {"train/%s" % k: v for k, v in {**logs_dict, "global_step": global_step}.items()}
                 self._wandb.log(logs)
+            # TensorBoard
+            elif self._tensorboard is not None and self.strategy.is_rank_0():
+                for k, v in logs_dict.items():
+                    self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
         # eval
-        if global_step % args.eval_steps == 0:
-            self.evaluate(self.eval_dataloader, global_step)
+        if global_step % args.eval_steps == 0 and self.eval_dataloader is not None:
+            # do eval when len(dataloader) > 0, avoid zero division in eval.
+            if len(self.eval_dataloader) > 0:
+                self.evaluate(self.eval_dataloader, global_step)
+
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            self.strategy.save_ckpt(self.model.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem)
+            if not self.disable_ds_ckpt:
+                self.strategy.save_ckpt(
+                    self.model.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
+                )
+            if self.save_hf_ckpt:
+                save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
+                self.strategy.save_model(self.model, self.tokenizer, save_path)
 
     def evaluate(self, eval_dataloader, steps=0):
         times = 0
@@ -184,10 +226,11 @@ class KDTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
 
-            for prompts_id_len, inputs, attention_masks, _ in eval_dataloader:
+            for inputs, attention_masks, loss_masks in eval_dataloader:
                 inputs = inputs.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_masks.squeeze(1).to(torch.cuda.current_device())
                 logits = self.model(inputs, attention_mask=attention_mask, return_output=True)["logits"]
+                prompts_id_len = (loss_masks != 0).int().argmax(dim=-1).squeeze(-1)
 
                 labels = torch.where(
                     attention_mask.bool(),
@@ -206,7 +249,12 @@ class KDTrainer(ABC):
                 logs = self.strategy.all_reduce(bar_dict)
                 step_bar.set_postfix(logs)
 
-            if self._wandb is not None and self.strategy.is_rank_0():
-                logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
-                self._wandb.log(logs)
+            if self.strategy.is_rank_0():
+                if self._wandb is not None:
+                    logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
+                    self._wandb.log(logs)
+                elif self._tensorboard is not None:
+                    for k, v in logs.items():
+                        self._tensorboard.add_scalar(f"eval/{k}", v, steps)
+
         self.model.train()  # reset model state

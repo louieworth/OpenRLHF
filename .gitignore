@@ -151,3 +151,4 @@ core
 .nfs*
 *jianh*
 *test_scripts*
+*/checkpoint/*

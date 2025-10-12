@@ -6,16 +6,17 @@ import torch.nn as nn
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
 from transformers import AutoConfig, AutoModel, BitsAndBytesConfig
-from transformers.deepspeed import HfDeepSpeedConfig
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
-from openrlhf.utils.logging import init_logger
+from openrlhf.utils.logging_utils import init_logger
+
+from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
 
 logger = init_logger(__name__)
 
 
 # Construct transformer with a value head for sequence classification.
-# https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L1310
+# https://github.com/huggingface/transformers/blob/405b56269812056d9593869e22b7b264d806cb1e/src/transformers/models/llama/modeling_llama.py#L1254
 def get_llm_for_sequence_regression(
     model_name_or_path: str,
     model_type: str,
@@ -27,26 +28,37 @@ def get_llm_for_sequence_regression(
     target_modules=None,
     lora_dropout=0,
     normalize_reward=False,
-    use_flash_attention_2=False,
+    attn_implementation="flash_attention_2",
     ds_config: dict = None,
-    init_value_head: bool = False,
-    head_prefix="value_head",
+    init_value_head=False,
+    value_head_prefix="score",
     device_map=None,
+    packing_samples=False,
     **kwargs,
 ) -> nn.Module:
-    """Get transformer with a sequence classification head on top (linear layer).
+    """Retrieve a transformer model with a sequence regression head on top.
+
+    This function loads a pretrained transformer model and attaches a linear layer for sequence regression.
 
     Args:
-        model_name_or_path (str): Path to pretrained model.
-        model_type (str): Either "reward" or "critic.
-        bf16 (bool, optional): Whether enable bfloat16. Defaults to True.
-        normalize_reward (bool, optional): Whether normalize reward. Defaults to False.
-        use_flash_attention_2 (bool, optional): Whether use Flash Attention 2.0. Defaults to False.
-        ds_config (dict, optional): Deepspeed config, used to automatically splitting the model onto
-            multiple gpus during from_pretrained when ZeRO-3 enabled. Defaults to None.
+        model_name_or_path (str): Path to the pretrained model.
+        model_type (str): Type of the model, either "reward" or "critic".
+        bf16 (bool, optional): Enable bfloat16 precision. Defaults to True.
+        load_in_4bit (bool, optional): Load the model in 4-bit precision. Defaults to False.
+        lora_rank (int, optional): Rank for LoRA adaptation. Defaults to 0.
+        lora_alpha (int, optional): Alpha parameter for LoRA. Defaults to 16.
+        target_modules (list, optional): List of target modules for LoRA. Defaults to None.
+        lora_dropout (float, optional): Dropout rate for LoRA layers. Defaults to 0.
+        normalize_reward (bool, optional): Normalize reward values. Defaults to False.
+        use_flash_attention_2 (bool, optional): Use Flash Attention 2.0. Defaults to False.
+        ds_config (dict, optional): Deepspeed configuration for model partitioning across multiple GPUs when ZeRO-3 is enabled. Defaults to None.
+        init_value_head (bool, optional): Initialize the value head. Defaults to False.
+        value_head_prefix (str, optional): Prefix for the value head. Defaults to "score".
+        device_map (dict, optional): Map of devices for model loading. Defaults to None.
+        packing_samples (bool, optional): Whether to pack samples during training. Defaults to False.
 
     Returns:
-        nn.Module: pretrained transformer model.
+        nn.Module: A pretrained transformer model with a sequence regression head.
     """
     assert (
         model_type == "critic" or model_type == "reward"
@@ -54,43 +66,18 @@ def get_llm_for_sequence_regression(
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     config.normalize_reward = normalize_reward
-    config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
+    config._attn_implementation = attn_implementation
 
-    try:
-        base_class = AutoModel._model_mapping[type(config)]
-        base_pretrained_class = base_class.__base__
-        if model_type == "reward":
-            cls_class = _get_reward_model(base_pretrained_class, base_class, head_prefix)
-        else:
-            cls_class = _get_critic_model(base_pretrained_class, base_class, head_prefix)
-    except Exception as e:
-        print("Failed to load from AutoModel, construct from modelling file.")
-        module_file, causal_model_name = config.auto_map["AutoModelForCausalLM"].split(".")
+    # Prioritize using the value_head_prefix in the model configuration.
+    value_head_prefix = getattr(config, "value_head_prefix", value_head_prefix)
+    logger.info(f"set value_head_prefix to `{value_head_prefix}`")
 
-        # special case
-        if causal_model_name == "QWenLMHeadModel":
-            auto_model_name = "QWenModel"
-            pretrained_model_name = "QWenPreTrainedModel"
-        elif causal_model_name == "InternLMForCausalLM":
-            auto_model_name = "InternLMModel"
-            pretrained_model_name = "InternLMPreTrainedModel"
-        else:
-            if "AutoModel" not in config.auto_map:
-                auto_model_name = causal_model_name.split("For")[0] + "Model"
-            else:
-                auto_model_name = config.auto_map["AutoModel"].split(".")[1]
-            pretrained_model_name = causal_model_name.split("For")[0] + "PreTrainedModel"
-
-        logger.info(f"BASE_MODEL_CLASS: {auto_model_name}, PRETRAINED_MODEL_CLASS: {pretrained_model_name}")
-
-        base_pretrained_class = get_class_from_dynamic_module(
-            f"{module_file}.{pretrained_model_name}", model_name_or_path
-        )
-        base_class = get_class_from_dynamic_module(f"{module_file}.{auto_model_name}", model_name_or_path)
-        if model_type == "reward":
-            cls_class = _get_reward_model(base_pretrained_class, base_class, head_prefix)
-        else:
-            cls_class = _get_critic_model(base_pretrained_class, base_class, head_prefix)
+    base_class = AutoModel._model_mapping[type(config)]
+    base_pretrained_class = base_class.__base__
+    if model_type == "reward":
+        cls_class = _get_reward_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
+    else:
+        cls_class = _get_critic_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
 
     # Note: dschf is defined in function scope to avoid global effects
     # https://huggingface.co/docs/transformers/main_classes/deepspeed#nontrainer-deepspeed-integration
@@ -138,7 +125,7 @@ def get_llm_for_sequence_regression(
                     module = module.to(torch.bfloat16)
                 if "norm" in name:
                     module = module.to(torch.float32)
-                if head_prefix in name or "embed_tokens" in name:
+                if value_head_prefix in name or "embed_tokens" in name:
                     if hasattr(module, "weight"):
                         module = module.to(torch.bfloat16)
 
@@ -148,22 +135,34 @@ def get_llm_for_sequence_regression(
         print("[MoE] set output_router_logits as True")
         model.config.output_router_logits = True
 
+        # set_z3_leaf_modules is required for MoE models
+        for m in model.modules():
+            # https://github.com/microsoft/DeepSpeed/pull/4966
+            if "SparseMoeBlock" in m.__class__.__name__:
+                deepspeed.utils.set_z3_leaf_modules(model, [m.__class__])
+                print(f"Setting zero3 leaf for model on class with name: {m.__class__.__name__}")
+                break
+
+    # https://github.com/huggingface/transformers/issues/26877
+    model.config.use_cache = False
+
     # NOTE: For reward model training only, intialize value_head manually
     # because deepspeed.zero.Init() will not intialize them.
     # TODO: Find a better way to clarify reward model training.
     if init_value_head:
+        value_head = getattr(model, value_head_prefix)
         if dschf is not None:
             logger.info("initialize value_head for ZeRO-3 reward model training.")
-            with deepspeed.zero.GatheredParameters([model.value_head.weight], modifier_rank=0):
+            with deepspeed.zero.GatheredParameters([value_head.weight], modifier_rank=0):
                 if torch.distributed.get_rank() == 0:
-                    model.value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
+                    value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
         else:
-            model.value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
+            value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
 
     return model
 
 
-def _get_reward_model(base_pretrained_model, base_llm_model, head_prefix="value_head"):
+def _get_reward_model(base_pretrained_model, base_llm_model, value_head_prefix="score", packing_samples=False):
     class RewardModel(base_pretrained_model):
         supports_gradient_checkpointing = True
 
@@ -171,8 +170,10 @@ def _get_reward_model(base_pretrained_model, base_llm_model, head_prefix="value_
             super().__init__(config)
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
-            self.head_prefix = head_prefix
-            setattr(self, head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+            self.value_head_prefix = value_head_prefix
+            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+
+            self.packing_samples = packing_samples
 
             # mean std
             self.normalize_reward = config.normalize_reward
@@ -189,35 +190,43 @@ def _get_reward_model(base_pretrained_model, base_llm_model, head_prefix="value_
             input_ids: torch.LongTensor = None,
             attention_mask: Optional[torch.Tensor] = None,
             return_output=False,
+            ring_attn_group=None,
+            pad_sequence=False,
+            packed_seq_lens=None,
         ) -> torch.Tensor:
-            # https://github.com/OpenLLMAI/OpenRLHF/issues/217
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
+            batch, seqlen = input_ids.size()
+            eos_indices = attention_mask.size(1) - 1 - attention_mask.long().fliplr().argmax(dim=1, keepdim=True)
+            forward_attention_mask = attention_mask
+            if self.packing_samples:
+                input_ids, position_ids, _, ring_attn_pad_len, indices = unpad_and_slice_tensor(
+                    input_ids, attention_mask, ring_attn_group
+                )
+                forward_attention_mask = None
+            else:
+                # https://github.com/OpenRLHF/OpenRLHF/issues/217
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+
             outputs = getattr(self, self.base_model_prefix)(
-                input_ids, attention_mask=attention_mask, position_ids=position_ids
+                input_ids, attention_mask=forward_attention_mask, position_ids=position_ids
             )
             last_hidden_states = outputs["last_hidden_state"]
-            values = getattr(self, self.head_prefix)(last_hidden_states).squeeze(-1)
 
-            # left padding in training mode
-            if self.training:
-                reward = values[:, -1]
-            else:
-                eos_indices = attention_mask.size(1) - 1 - attention_mask.long().fliplr().argmax(dim=1, keepdim=True)
-                reward = values.gather(dim=1, index=eos_indices).squeeze(1)
+            values = getattr(self, self.value_head_prefix)(last_hidden_states).squeeze(-1)
 
-                # normalize reward in eval mode
-                if self.normalize_reward:
-                    reward = (reward - self.mean) / self.std
-            if return_output:
-                return reward, outputs
-            else:
-                return reward
+            if self.packing_samples:
+                values = gather_and_pad_tensor(values, ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
+            reward = values.gather(dim=1, index=eos_indices).squeeze(1)
+
+            if not self.training and self.normalize_reward:
+                reward = (reward - self.mean) / self.std
+
+            return (reward, outputs) if return_output else reward
 
     return RewardModel
 
 
-def _get_critic_model(base_pretrained_model, base_llm_model, head_prefix="value_head"):
+def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="score", packing_samples=False):
     class CriticModel(base_pretrained_model):
         supports_gradient_checkpointing = True
 
@@ -225,8 +234,10 @@ def _get_critic_model(base_pretrained_model, base_llm_model, head_prefix="value_
             super().__init__(config)
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
-            self.head_prefix = head_prefix
-            setattr(self, head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+            self.value_head_prefix = value_head_prefix
+            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+
+            self.packing_samples = packing_samples
 
             # mean std
             self.normalize_reward = config.normalize_reward
@@ -244,26 +255,46 @@ def _get_critic_model(base_pretrained_model, base_llm_model, head_prefix="value_
             action_mask: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             return_output=False,
+            ring_attn_group=None,
+            values_allgather=False,
+            packed_seq_lens=None,
         ) -> torch.Tensor:
-            # https://github.com/OpenLLMAI/OpenRLHF/issues/217
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            outputs = getattr(self, self.base_model_prefix)(
-                input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
-            last_hidden_states = outputs["last_hidden_state"]
-            values = getattr(self, self.head_prefix)(last_hidden_states).squeeze(-1)[:, :-1]
-            num_actions = action_mask.size(1)
+            batch, seqlen = input_ids.size()
+            forward_attention_mask = attention_mask
+            if self.packing_samples:
+                input_ids, position_ids, _, ring_attn_pad_len, indices = unpad_and_slice_tensor(
+                    input_ids, attention_mask, ring_attn_group
+                )
+                forward_attention_mask = None
+            else:
+                # https://github.com/OpenRLHF/OpenRLHF/issues/217
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
 
+            outputs = getattr(self, self.base_model_prefix)(
+                input_ids, attention_mask=forward_attention_mask, position_ids=position_ids
+            )
+
+            if action_mask is None:
+                assert return_output
+                return outputs
+
+            last_hidden_states = outputs["last_hidden_state"]
+            values = getattr(self, self.value_head_prefix)(last_hidden_states).squeeze(-1)  # (1, total_seqs)
+
+            if self.packing_samples:
+                values = gather_and_pad_tensor(values, ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
+
+            values = values[:, :-1]
             # normalize reward
             if self.normalize_reward:
                 values = (values - self.mean) / self.std
 
+            action_values = values[:, -action_mask.shape[1] :] * action_mask.float()
+
             if return_output:
-                return outputs if num_actions is None else (values[:, -num_actions:], outputs)
+                return (action_values, outputs)
             else:
-                return values[:, -num_actions:]
+                return action_values
 
     return CriticModel

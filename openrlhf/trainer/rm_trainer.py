@@ -1,29 +1,29 @@
-import math
+import os
 from abc import ABC
 
-import loralib as lora
 import torch
-from torch import nn
 from torch.optim import Optimizer
-from torch.utils.data import DistributedSampler
 from tqdm import tqdm
 
-from openrlhf.models import LogExpLoss, PairWiseLoss, SwitchBalancingLoss
+from openrlhf.models import LogExpLoss, PairWiseLoss
+from openrlhf.utils.distributed_sampler import DistributedSampler
 
 
 class RewardModelTrainer(ABC):
     """
-        Trainer to use while training reward model.
+    Trainer for training a reward model.
 
     Args:
-        model (torch.nn.Module): the model to train
-        strategy (Strategy): the strategy to use for training
-        optim(Optimizer): the optimizer to use for training
-        train_dataset (RewardDataset): the dataset to use for training
-        eval_dataset (RewardDataset): the dataset to use for evaluation
-        batch_size (int, defaults to 1): the batch size while training
-        max_epochs (int, defaults to 2): the number of epochs to train
-        optim_kwargs (dict, defaults to {'lr':1e-4}): the kwargs to use while initializing optimizer
+        model (torch.nn.Module): The model to be trained.
+        strategy (Strategy): The training strategy to apply.
+        optim (Optimizer): The optimizer to use during training.
+        train_dataloader (DataLoader): The dataloader for the training dataset.
+        eval_dataloader (DataLoader): The dataloader for the evaluation dataset.
+        scheduler (Scheduler): The learning rate scheduler for dynamic adjustments during training.
+        tokenizer (Tokenizer): The tokenizer for processing input text data.
+        max_norm (float, defaults to 0.5): Maximum gradient norm for gradient clipping.
+        max_epochs (int, defaults to 2): Maximum number of training epochs.
+        loss (str, defaults to "sigmoid"): The loss function to use during training, e.g., "sigmoid".
     """
 
     def __init__(
@@ -38,6 +38,8 @@ class RewardModelTrainer(ABC):
         max_norm=0.5,
         max_epochs: int = 2,
         loss="sigmoid",
+        disable_ds_ckpt=False,
+        save_hf_ckpt=False,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -50,6 +52,8 @@ class RewardModelTrainer(ABC):
         self.optimizer = optim
         self.tokenizer = tokenizer
         self.args = strategy.args
+        self.disable_ds_ckpt = disable_ds_ckpt
+        self.save_hf_ckpt = save_hf_ckpt
 
         if loss == "sigmoid":
             self.loss_fn = PairWiseLoss()
@@ -61,10 +65,15 @@ class RewardModelTrainer(ABC):
         # Mixtral 8*7b
         self.aux_loss = self.args.aux_loss_coef > 1e-8
 
+        # packing samples
+        self.packing_samples = strategy.args.packing_samples
+
         self.margin_loss = self.strategy.args.margin_loss
         self.compute_fp32_loss = self.strategy.args.compute_fp32_loss
 
+        # wandb/tensorboard setting
         self._wandb = None
+        self._tensorboard = None
         if self.strategy.args.use_wandb and self.strategy.is_rank_0():
             import wandb
 
@@ -85,16 +94,36 @@ class RewardModelTrainer(ABC):
             wandb.define_metric("eval/global_step")
             wandb.define_metric("eval/*", step_metric="eval/global_step", step_sync=True)
 
-    def fit(self, args):
+        # Initialize TensorBoard writer if wandb is not available
+        if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
+            from torch.utils.tensorboard import SummaryWriter
+
+            os.makedirs(self.strategy.args.use_tensorboard, exist_ok=True)
+            log_dir = os.path.join(self.strategy.args.use_tensorboard, strategy.args.wandb_run_name)
+            self._tensorboard = SummaryWriter(log_dir=log_dir)
+
+    def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # get eval and save steps
         if args.eval_steps == -1:
-            args.eval_steps = self.train_dataloader.__len__()  # Evaluate once per epoch
+            args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
         if args.save_steps == -1:
             args.save_steps = float("inf")  # do not save ckpt
+        self.num_update_steps_per_epoch = num_update_steps_per_epoch
 
-        global_step = 1
-        epoch_bar = tqdm(range(self.epochs), desc="Train epoch", disable=not self.strategy.is_rank_0())
-        for epoch in range(self.epochs):
+        # Restore step and start_epoch
+        step = consumed_samples // args.train_batch_size * self.strategy.accumulated_gradient + 1
+        start_epoch = consumed_samples // args.train_batch_size // num_update_steps_per_epoch
+        consumed_samples = consumed_samples % (num_update_steps_per_epoch * args.train_batch_size)
+
+        epoch_bar = tqdm(range(start_epoch, self.epochs), desc="Train epoch", disable=not self.strategy.is_rank_0())
+        acc_sum = 0
+        loss_sum = 0
+        for epoch in range(start_epoch, self.epochs):
+            if isinstance(self.train_dataloader.sampler, DistributedSampler):
+                self.train_dataloader.sampler.set_epoch(
+                    epoch, consumed_samples=0 if epoch > start_epoch else consumed_samples
+                )
+
             #  train
             step_bar = tqdm(
                 range(self.train_dataloader.__len__()),
@@ -102,26 +131,22 @@ class RewardModelTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
 
-            if isinstance(self.train_dataloader.sampler, DistributedSampler):
-                self.train_dataloader.sampler.set_epoch(epoch)
-
             self.model.train()
-            acc_mean = 0
-            loss_mean = 0
-            for chosen_ids, c_mask, reject_ids, r_mask, margin in self.train_dataloader:
+            for data in self.train_dataloader:
+                chosen_ids, c_mask, reject_ids, r_mask, margin = data
                 chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
                 c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
                 reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
                 r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
 
+                chosen_reward, reject_reward, aux_loss = self.concatenated_forward(
+                    self.model, chosen_ids, c_mask, reject_ids, r_mask
+                )
+
                 if self.margin_loss:
                     margin = torch.tensor(margin).to(torch.cuda.current_device())
                 else:
                     margin = None
-
-                chosen_reward, reject_reward, aux_loss = self.concatenated_forward(
-                    self.model, chosen_ids, c_mask, reject_ids, r_mask
-                )
 
                 # loss function
                 if self.compute_fp32_loss:
@@ -137,52 +162,74 @@ class RewardModelTrainer(ABC):
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
-                acc_mean = acc_mean * 0.9 + 0.1 * (chosen_reward > reject_reward).float().mean().item()
-                loss_mean = loss_mean * 0.9 + 0.1 * preference_loss.item()
+                acc = (chosen_reward > reject_reward).float().mean().item()
+                acc_sum += acc
+                loss_sum += preference_loss.item()
                 # optional rm info
                 logs_dict = {
-                    "preference_loss": preference_loss.item(),
+                    "loss": preference_loss.item(),
+                    "acc": acc,
                     "chosen_reward": chosen_reward.mean().item(),
                     "reject_reward": reject_reward.mean().item(),
-                    "acc_mean": acc_mean,
-                    "loss_mean": loss_mean,
+                    "lr": self.scheduler.get_last_lr()[0],
                 }
                 if self.aux_loss:
                     logs_dict["aux_loss"] = aux_loss.item()
-                # logs/checkpoints/evaluate
-                self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict)
 
+                # step bar
+                logs_dict = self.strategy.all_reduce(logs_dict)
+                step_bar.set_postfix(logs_dict)
                 step_bar.update()
-                global_step += 1
+
+                # logs/checkpoints/evaluation
+                if step % self.strategy.accumulated_gradient == 0:
+                    logs_dict["loss_mean"] = loss_sum / self.strategy.accumulated_gradient
+                    logs_dict["acc_mean"] = acc_sum / self.strategy.accumulated_gradient
+                    loss_sum = 0
+                    acc_sum = 0
+                    global_step = step // self.strategy.accumulated_gradient
+                    client_states = {"consumed_samples": global_step * args.train_batch_size}
+                    self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
+
+                step += 1
             epoch_bar.update()
 
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
+        if self._tensorboard is not None and self.strategy.is_rank_0():
+            self._tensorboard.close()
 
     # logs/checkpoints/evaluate
-    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}):
+    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:
-            # step bar
-            logs_dict = self.strategy.all_reduce(logs_dict)
-            step_bar.set_postfix(logs_dict)
-
             # wandb
-            if (
-                self._wandb is not None
-                and self.strategy.is_rank_0()
-                and global_step % self.strategy.accumulated_gradient == 0
-            ):
+            if self._wandb is not None and self.strategy.is_rank_0():
                 logs = {"train/%s" % k: v for k, v in {**logs_dict, "global_step": global_step}.items()}
                 self._wandb.log(logs)
+            # TensorBoard
+            elif self._tensorboard is not None and self.strategy.is_rank_0():
+                for k, v in logs_dict.items():
+                    self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
         # eval
-        if global_step % args.eval_steps == 0:
-            self.evaluate(self.eval_dataloader, global_step)
+        if (
+            global_step % args.eval_steps == 0 or global_step % self.num_update_steps_per_epoch == 0
+        ) and self.eval_dataloader is not None:
+            # do eval when len(dataloader) > 0, avoid zero division in eval.
+            if len(self.eval_dataloader) > 0:
+                self.evaluate(self.eval_dataloader, global_step)
+
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            self.strategy.save_ckpt(self.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem)
+            if not self.disable_ds_ckpt:
+                self.strategy.save_ckpt(
+                    self.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
+                )
+            if self.save_hf_ckpt:
+                save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
+                self.strategy.save_model(self.model, self.tokenizer, save_path)
 
     def evaluate(self, eval_dataloader, steps=0):
         step_bar = tqdm(
@@ -195,16 +242,22 @@ class RewardModelTrainer(ABC):
             acc = 0
             rewards = []
             loss_sum = 0
-            for chosen_ids, c_mask, reject_ids, r_mask, margin in eval_dataloader:
+            for data in eval_dataloader:
+                chosen_ids, c_mask, reject_ids, r_mask, margin = data
                 chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
                 c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
                 reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
                 r_mask = r_mask.squeeze(1).to(torch.cuda.current_device())
-                margin = torch.tensor(margin).to(torch.cuda.current_device())
 
                 chosen_reward, reject_reward, _ = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask
                 )
+
+                if self.margin_loss:
+                    margin = torch.tensor(margin).to(torch.cuda.current_device())
+                else:
+                    margin = None
+
                 loss = self.loss_fn(chosen_reward, reject_reward, margin)
 
                 rewards += [chosen_reward.flatten(), reject_reward.flatten()]
@@ -212,8 +265,8 @@ class RewardModelTrainer(ABC):
                 loss_sum += loss.item()
                 step_bar.update()
 
-            acc_mean = acc / self.eval_dataloader.__len__()
-            loss_mean = loss_sum / self.eval_dataloader.__len__()
+            acc_mean = acc / eval_dataloader.__len__()
+            loss_mean = loss_sum / eval_dataloader.__len__()
 
             rewards = torch.cat(rewards).float()
             rewards = self.strategy.all_gather(rewards)
@@ -239,9 +292,13 @@ class RewardModelTrainer(ABC):
             self.strategy.print("histgram")
             self.strategy.print(histgram)
 
-            if self._wandb is not None and self.strategy.is_rank_0():
-                logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
-                self._wandb.log(logs)
+            if self.strategy.is_rank_0():
+                if self._wandb is not None:
+                    logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
+                    self._wandb.log(logs)
+                elif self._tensorboard is not None:
+                    for k, v in logs.items():
+                        self._tensorboard.add_scalar(f"eval/{k}", v, steps)
         self.model.train()  # reset model state
 
     def concatenated_forward(self, model, chosen_ids, c_mask, reject_ids, r_mask):

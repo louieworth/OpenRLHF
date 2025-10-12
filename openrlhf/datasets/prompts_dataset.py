@@ -1,41 +1,21 @@
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from .utils import exist_and_not_none, process_multi_turn_dialogue
 
 
-def preprocess_data(data, input_template=None, input_key=None, apply_chat_template=None) -> str:
-    # custom dataset
-    if input_key:
-        if apply_chat_template:
-            prompt = apply_chat_template(data[input_key], tokenize=False, add_generation_prompt=True)
-            input_template = None
-        else:
-            prompt = data[input_key]
+def preprocess_data(data, input_template=None, input_key="input", label_key=None, apply_chat_template=None) -> str:
+    if apply_chat_template:
+        chat = data[input_key]
+        if isinstance(chat, str):
+            chat = [{"role": "user", "content": chat}]
+        prompt = apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
     else:
-        # Open-Orca/OpenOrca
-        if exist_and_not_none(data, "system_prompt") and exist_and_not_none(data, "response"):
-            prompt = data["system_prompt"] + " " + data["question"]
-        # Dahoas/full-hh-rlhf
-        elif exist_and_not_none(data, "prompt"):
-            prompt = data["prompt"]
-            # tasksource/oasst1_pairwise_rlhf_reward
-            if prompt.startswith("prompter:"):
-                prompt = (
-                    prompt.replace("prompter:", "\nHuman: ").replace("assistant:", "\nAssistant: ") + "\nAssistant: "
-                )
-            input_template = None  # do not modified with input template again
-        # RLHFlow/prompt-collection-v0.1
-        elif exist_and_not_none(data, "context_messages") and isinstance(data["context_messages"], list):
-            prompt = data["context_messages"]
-            prompt = process_multi_turn_dialogue(prompt, input_template=input_template)
-            input_template = None  # do not modified with input template again
-        else:
-            raise ValueError("Unknown prompts dataset")
+        prompt = data[input_key]
+        if input_template:
+            prompt = input_template.format(prompt)
 
-    # input template
-    if input_template:
-        prompt = input_template.format(prompt)
-    return prompt
+    # for Reinforced Fine-tuning
+    label = "" if label_key is None else data[label_key]
+    return prompt, label
 
 
 class PromptDataset(Dataset):
@@ -53,25 +33,33 @@ class PromptDataset(Dataset):
         dataset,
         tokenizer,
         strategy,
-        input_template="Human: {}\nAssistant: ",
+        input_template=None,
     ) -> None:
         super().__init__()
         self.strategy = strategy
         self.tokenizer = tokenizer
+
+        # chat_template
         self.input_template = input_template
         input_key = getattr(self.strategy.args, "input_key", None)
+        label_key = getattr(self.strategy.args, "label_key", None)
         apply_chat_template = getattr(self.strategy.args, "apply_chat_template", False)
+
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
 
         self.prompts = []
-        for data in tqdm(dataset, disable=not self.strategy.is_rank_0()):
-            prompt = preprocess_data(data, input_template, input_key, apply_chat_template)
+        self.labels = []
+        self.datasources = []
+        for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
+            prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
             self.prompts.append(prompt)
+            self.labels.append(label)
+            self.datasources.append(data.get("datasource", "default"))
 
     def __len__(self):
         length = len(self.prompts)
         return length
 
     def __getitem__(self, idx):
-        return self.prompts[idx]
+        return self.datasources[idx], self.prompts[idx], self.labels[idx]
